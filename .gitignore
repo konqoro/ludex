@@ -1,0 +1,29 @@
+# Compiled binaries
+/bin/
+nimcache/
+
+# Generated catalogue data: enrichment, ratings, response cache and the
+# downloaded art (thousands of jpgs). Re-creatable with `ludex enrich`/`ludex art`.
+/data/
+
+# Atlas-managed dependencies; the exact commits live in atlas.lock
+/deps/
+
+# Compiled test binaries land beside their sources; the sources are kept
+/tests/t*
+!/tests/t*.nim
+
+# Rendered window captures (ludex-snap) are review artefacts, not sources
+*.png
+
+# Agent tool state (crush.db grows to tens of megabytes per machine)
+/.crush/
+**/.crush/
+
+# Scratch copies of the tree used for prototyping (symlinks data/ and deps/)
+/redesign/
+
+# Editor and OS clutter
+*~
+*.swp
+.DS_Store

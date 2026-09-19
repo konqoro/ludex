@@ -1,0 +1,51 @@
+{
+  "items": {
+    "brian": {
+      "dir": "$deps/brian",
+      "url": "https://github.com/planetis-m/brian",
+      "commit": "0c4d6829edac388f867788b8392696ef0d5df022",
+      "version": ""
+    },
+    "owlkettle": {
+      "dir": "$deps/owlkettle",
+      "url": "https://github.com/can-lehmann/owlkettle",
+      "commit": "edc5256390eb97d77b829439aece0cbf5d629255",
+      "version": ""
+    }
+  },
+  "nimcfg": [
+    "--path:\"src\"",
+    "--hints:off",
+    "# The enrichment sources are HTTPS only, so TLS is not optional for the CLI.",
+    "--define:ssl",
+    "",
+    "############# begin Atlas config section ##########",
+    "--noNimblePath",
+    "--path:\"deps/brian/src\"",
+    "--path:\"deps/owlkettle\"",
+    "############# end Atlas config section   ##########",
+    ""
+  ],
+  "nimbleFile": {
+    "filename": "ludex.nimble",
+    "content": [
+      "version = \"0.1.0\"",
+      "author = \"ageralis\"",
+      "description = \"Local-first catalog and recommender for Linux-playable games\"",
+      "license = \"MIT\"",
+      "srcDir = \"src\"",
+      "binDir = \"bin\"",
+      "bin = @[\"ludex\"]",
+      "requires \"nim >= 2.0.0\"",
+      "requires \"https://github.com/planetis-m/brian\"",
+      "requires \"https://github.com/can-lehmann/owlkettle\"",
+      "",
+      ""
+    ]
+  },
+  "hostOS": "linux",
+  "hostCPU": "amd64",
+  "nimVersion": "2.3.1",
+  "gccVersion": "16.2.1",
+  "clangVersion": ""
+}
