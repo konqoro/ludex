@@ -372,8 +372,8 @@ One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), wi
 - **Politeness, measured.** The delay is per submission, not per round and not per
   completion, and the pacer's clock is a parameter rather than a call, so the floor is
   pinned by a test (`tests/tpacer.nim`) instead of asserted. Against a local timestamping
-  server, nine URLs at 1600 ms arrive 1600.1 ms apart on average (min 1599.7, max 1600.7),
-  and three URLs whose answers take 2.5 s each are still admitted 1600 ms apart rather
+  server, nine URLs at 1600 ms arrive 1600.1 ms apart on average (min 1599.3, max 1600.8),
+  and three URLs whose answers take 2.5 s each are still admitted about 1600 ms apart rather
   than 2500 ms — overlap is used (`inflight=2` on the server) *and* the floor holds. A
   hard `--limit` makes a sweep partial. A descriptive `User-Agent` with a contact URL.
 - **Overlap.** `relay` says how many sockets may be open, the pacer says how often one may
@@ -399,19 +399,23 @@ One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), wi
   URL answering `429` twice and then `200` ends as an answer after three requests with
   801 ms and 1301 ms gaps; a URL answering `500` forever ends as a problem after four
   attempts, and is not cached. A `429` also holds *every* admission back, because a source
-  that refuses us is telling us our idea of its budget is too generous. The client's own
+  that refuses us is telling us our idea of its budget is too generous: measured, a healthy
+  URL queued behind a refused one is admitted 801 ms later rather than within a
+  millisecond. The client's own
   error is `FetchError`, raised only for a client-level fault (a stopped relay, or a
   silence longer than twice relay's own request timeout); `relay`'s transport errors are
   values, and `Defect` is never caught, so a programming bug is never recorded as a source
   outage.
 - **Rejected: a token bucket.** A bucket of capacity c allows c submissions at once and
-  then the same average. Both ends were measured: with the floor removed, five URLs arrive
-  within a millisecond of each other, so the burst a bucket would spend is real; but the
-  sweeps this delay exists for are thousands of requests long, where the average governs —
-  a 6180-request Steam sweep spends about 2h45m at the floor, so a capacity-4 bucket buys
-  the first 4.8 s (0.05%) while permitting four extra requests inside the window budget the
-  floor is there to respect. `Pacer.hold` keeps the useful half of a bucket: a 429 pushes
-  every admission back, which is the part that responds to a source actually complaining.
+  then the same average. Both ends were measured. With the floor removed, five URLs arrive
+  within the same half second — relay dispatches them as fast as its poll cycle allows, so
+  those gaps are relay's ~250 ms cycle rather than our pacing — which is the burst a bucket
+  would be buying. But the sweeps this delay exists for are thousands of requests long,
+  where the average governs: a 6180-request Steam sweep spends about 2h45m at the floor, so
+  a capacity-4 bucket buys the first 4.8 s (0.05%) while permitting four extra requests
+  inside the window budget the floor is there to respect. `Pacer.hold` keeps the useful half
+  of a bucket: a 429 pushes every admission back, which is the part that responds to a
+  source actually complaining.
 - **Cost of the dependency.** `relay` shares `ref` objects across its worker thread, so it
   requires `--threads:on` and `--mm:atomicArc`, and it binds libcurl without linking it.
   Nim has no per-module memory model and `nimble`/Atlas do not propagate a dependency's
