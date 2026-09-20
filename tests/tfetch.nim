@@ -149,6 +149,57 @@ block a_corrupt_cache_file_is_a_miss:
   client.close()
   doAssert swept.outcomes[0].answer.isNone, "junk is a miss, never a response"
 
+block a_transient_status_in_the_cache_is_a_miss:
+  # An older version of this client cached a terminal 429 or 5xx as if it were an
+  # answer. Believing it now would be exactly the lie the write side refuses to
+  # write: the URL has to be asked again.
+  let dir = tempCache("transient")
+  let client = initClient(dir, delayMs = 0, offline = true)
+  writeCacheEntry(dir, SeedOne, 500, "the server was having a moment")
+  writeCacheEntry(dir, SeedTwo, 429, "")
+  let swept = fetchAll(client, @[SeedOne, SeedTwo])
+  client.close()
+  for outcome in swept.outcomes:
+    doAssert outcome.answer.isNone, "a cached failure is not an answer"
+    doAssert outcome.problem.contains("offline")
+  doAssert swept.stats.cached == 0
+
+block a_cache_write_leaves_no_temporary_file_behind:
+  # The entry is written beside its name and renamed into place, so a killed run
+  # cannot leave a truncated body that reads back as an answer.
+  let dir = tempCache("atomic")
+  writeCacheEntry(dir, SeedOne, 200, "one")
+  var entries: seq[string] = @[]
+  for path in walkFiles(dir / "*"):
+    entries.add path.extractFilename
+  doAssert entries == @[cacheFileName(SeedOne)],
+    "one entry, and no half-written file next to it"
+  doAssert readCacheEntry(dir, SeedOne).get.body == "one"
+
+block a_client_is_owned_by_one_sweep_at_a_time:
+  # Two sweeps sharing a client's window would interleave their requests, and
+  # neither could tell whose answer arrived. That is refused, not guessed at.
+  let dir = tempCache("owned")
+  let client = initClient(dir, delayMs = 0, offline = true)
+  writeCacheEntry(dir, SeedOne, 200, "one")
+  var open = initSweep(client, @[SeedOne, SeedTwo])
+  doAssert open.pending == 2, "nothing has been asked for yet"
+  doAssertRaises FetchError:
+    discard initSweep(client, @[SeedTwo])
+  while open.next().isSome:
+    discard
+  client.close()
+
+block a_drained_sweep_hands_the_client_back:
+  let dir = tempCache("handback")
+  let client = initClient(dir, delayMs = 0, offline = true)
+  writeCacheEntry(dir, SeedOne, 200, "one")
+  let first = fetchAll(client, @[SeedOne])
+  doAssert first.outcomes[0].answer.isSome
+  let second = fetchAll(client, @[SeedOne])
+  doAssert second.outcomes[0].answer.isSome, "the next sweep is welcome"
+  client.close()
+
 block fetch_is_the_single_url_case:
   let dir = tempCache("single")
   let client = initClient(dir, delayMs = 0, offline = true)

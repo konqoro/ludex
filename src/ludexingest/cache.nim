@@ -24,6 +24,13 @@
 
 import std/[options, os, strutils]
 
+when defined(posix):
+  proc cRename(source, dest: cstring): cint {.importc: "rename",
+    header: "<stdio.h>".}
+    ## `rename(2)`, the only way to publish a file atomically. Nim's `moveFile`
+    ## would do the same, but its effect signature includes `Exception`, which is
+    ## wider than this module's contract can allow.
+
 const MaxNameLength = 180
 
 type
@@ -96,16 +103,28 @@ proc writeCacheEntry*(dir, url: string; status: int; body: string)
   ## failure is an `IOError`, the closest thing the environment has to offer:
   ## the fetch layer translates it into its own error type at its own boundary,
   ## which is where a caller can say what a cache write failure means.
+  ##
+  ## The bytes are written beside the final name and renamed into place, so a run
+  ## killed mid-write cannot leave a truncated body that later reads back as an
+  ## answer. The temporary name carries a `~`, which `cacheFileName` can never
+  ## produce, so no URL can look it up. Where no atomic rename is bound, the entry
+  ## is written in place and a torn write stays possible.
   try:
     createDir(dir)
+    let path = cachePath(dir, url)
+    let target = when defined(posix): path & "~tmp" else: path
     # Header and body are written separately: joining them would copy the whole
     # body (a picture is 50-200 KB, and a sweep is thousands of them) for a
     # string that exists only to be written out and dropped.
-    let file = open(cachePath(dir, url), fmWrite)
+    let file = open(target, fmWrite)
     try:
       file.write("HTTP/1.1 " & $status & "\n\n")
       file.write(body)
     finally:
       file.close()
+    when defined(posix):
+      if cRename(target.cstring, path.cstring) != 0:
+        raise newException(IOError, "cannot publish " & path & ": " &
+                           osErrorMsg(osLastError()))
   except CatchableError as error:
     raise newException(IOError, "cannot cache " & url & ": " & error.msg)

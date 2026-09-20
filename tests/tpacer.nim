@@ -15,6 +15,15 @@ block the_first_submission_is_immediate:
   doAssert dueInMs(pacer, 0) == 0,
     "nothing has been admitted yet, so nothing is held back"
 
+block a_clock_reading_of_zero_is_still_a_floor:
+  # The reason "has anything been admitted" is a flag and not a sentinel value: a
+  # monotonic clock can read 0, and a pacer that mistook that for "never" would
+  # skip the floor on the second submission.
+  var pacer = Pacer(delayMs: 1600)
+  admit(pacer, 0)
+  doAssert dueInMs(pacer, 0) == 1600
+  doAssert dueInMs(pacer, 1599) == 1
+
 block one_submission_per_delay:
   var pacer = Pacer(delayMs: 1600)
   admit(pacer, 10_000)

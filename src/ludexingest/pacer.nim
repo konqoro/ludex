@@ -37,9 +37,12 @@ type
     delayMs*: int
       ## The floor between two submissions; 0 means no pacing at all, which is
       ## what a source that answers once for the whole dataset wants.
+    admitted: bool
+      ## Whether a submission has happened yet. A separate flag because a
+      ## monotonic clock can legitimately read 0 in the first millisecond of
+      ## uptime, so no timestamp value can also mean "never".
     lastMs: int64
-      ## When the last submission was admitted. 0 means "never", which is why a
-      ## fresh pacer admits immediately.
+      ## When the last submission was admitted.
     holdUntilMs: int64
       ## A cooldown the source itself asked for; no admission before this.
 
@@ -60,13 +63,14 @@ func dueInMs*(pacer: Pacer; nowMs: int64): int64 =
   ##
   ## The result is never negative, so a caller can use it as a sleep without
   ## clamping: a submission that arrived late is due immediately.
-  if pacer.delayMs > 0 and pacer.lastMs > 0:
+  if pacer.delayMs > 0 and pacer.admitted:
     result = max(result, int64(pacer.delayMs) - (nowMs - pacer.lastMs))
   result = max(result, pacer.holdUntilMs - nowMs)
 
 proc admit*(pacer: var Pacer; nowMs: int64) =
   ## Stamps an admission. The caller has already waited out `dueInMs`.
   pacer.lastMs = nowMs
+  pacer.admitted = true
 
 proc hold*(pacer: var Pacer; nowMs: int64; ms: int) =
   ## Pushes every admission back by `ms` from `nowMs`.

@@ -810,4 +810,12 @@ proc main() =
   else: fail("unknown command: " & request.command)
 
 when isMainModule:
-  main()
+  # A client-level fault (a stopped relay worker, a silence no source could be
+  # responsible for) is the one failure that is not a fact about any one game, and
+  # it arrives as `FetchError`. It is reported like every other user-facing
+  # problem rather than as a traceback.
+  try:
+    main()
+  except FetchError as error:
+    stderr.writeLine("ludex: " & error.msg)
+    quit 1
