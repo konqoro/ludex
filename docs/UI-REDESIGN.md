@@ -120,9 +120,9 @@ driving the window.
   window at several sizes through the capture harness.
 - High-contrast and increased-text presentation relies on libadwaita defaults and was not
   exercised with a theme switcher or a text-scaling change.
-- Scroll restoration waits for the first non-zero adjustment upper bound, so a very fast
-  back-and-forth could restore a slightly stale offset. The window keeps the query and page
-  regardless, and no reproducer for a wrong offset was found.
+- Scroll restoration is now GTK's own: the collection is never unmounted while browsing, so
+  returning to it keeps its offset. A new search, filter or page bumps a generation that
+  scrolls the view back to the top on the next redraw.
 
 ## Visual design pass
 
@@ -176,8 +176,8 @@ upscaling or stretching an image beyond what it has.
 
 - **A viewer, not a dialog.** Opening a picture shows it full-window on a dark `.osd`
   backdrop with circular OSD browse buttons on the edges, the position in the header, and
-  the back button closing it. Escape and the arrow keys work through the buttons' own
-  shortcuts.
+  the back button closing it. Escape goes back through a hidden window shortcut, and
+  PageUp/PageDown step through the pictures.
 - **No stretching.** The viewer uses `ContentScaleDown` and loads the file at its native
   size, so a 600px screenshot is shown at 600px rather than blown up to the window.
   `ludexcore/art.nim` now prefers the store's full-size screenshot URL so there are more
@@ -192,12 +192,12 @@ upscaling or stretching an image beyond what it has.
   score is real data rather than a guess. Both were already in the response this project
   downloads; they were simply not modelled.
 
-- **A banner with pixels to spare.** The banner was the store's 460x215 header drawn at
-  more than twice its size. It now uses the store's own wide page art (1438x810), and its
-  height comes from that picture's aspect at the column width, so it fills the column with
-  no letterbox bars. The header stays on disk as the fallback for a game that has no wide
-  art, and it is no longer offered as a "view full size" picture, because the store sends
-  it smaller than the page already draws it.
+- **A wide banner, cropped to a band.** The banner uses the store's wide page art
+  (1438x810) as the first choice, drawn at a fixed 220px height with `ContentCover`, so the
+  column is filled by a centred horizontal slice rather than by a letterboxed or stretched
+  image. The header stays on disk as the fallback for a game that has no wide art, and it
+  is no longer offered as a "view full size" picture, because the store sends it smaller
+  than the page already draws it.
 
 A crash found while testing this pass is recorded in `AGENTS.md`: Owlkettle asserts that a
 button's shortcut never changes after build, so the header button could not switch between
@@ -208,12 +208,12 @@ Alt+Left and Escape, and doing so terminated the window.
 Filtering was three checkable rows buried in the primary menu, and the checkmark was drawn
 with `ModelButton.icon`, which sets GTK's `iconic` and therefore replaced each row's label
 with a bare tick. The guidance for this pass was the HIG's Menus pattern (a secondary menu
-opens from `view-more-symbolic` and may contain check rows, grouped, 3-12 items) and the
-Popovers pattern (a popover holds a set of view controls, grouped, closed with Escape).
+opens from a secondary-menu control and may contain check rows, grouped, 3-12 items) and
+the Popovers pattern (a popover holds a set of view controls, grouped, closed with Escape).
 
 - **Its own button.** The filters moved out of the primary menu into a `MenuButton` next to
-  it, so the collection's own controls are visible without opening the app menu. The icon is
-  `view-more-symbolic`, GNOME's secondary-menu icon: no funnel icon exists in the Adwaita
+  it, so the collection's own controls are visible without opening the app menu. It is a
+  labelled button with a `pan-down-symbolic` chevron: no funnel icon exists in the Adwaita
   theme installed here, and a missing name renders as a blank placeholder (see `AGENTS.md`).
 - **Real check rows.** `widgets.nim`'s `CheckedMenuItem` is a `GtkModelButton` with
   `role = check` and `active`, so the label stays and GTK draws its own indicator. Because a

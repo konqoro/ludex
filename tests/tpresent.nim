@@ -95,6 +95,10 @@ block the_pitch_and_press_score_are_labelled:
     "the store's short HTML is dropped and its entities decoded"
   doAssert plainText("one   two\n\nthree") == "one two three",
     "runs of whitespace collapse, because the source is full of newlines"
+  doAssert plainText("a < b with no tag") == "a < b with no tag",
+    "an unterminated tag opener stays as text instead of eating the rest"
+  doAssert plainText("before &") == "before &",
+    "an ampersand without an entity stays literal"
   facts.critics = some Critics(score: initFact(80, srcSteam, 1))
   doAssert criticsSummary(facts) == "80 on Metacritic",
     "the number is named, so it is not read as a player score"

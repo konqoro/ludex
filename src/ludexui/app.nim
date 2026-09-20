@@ -64,6 +64,7 @@ viewable App:
   page: int
   items: seq[BrowseItem]
   pictures: Table[string, Option[Pixbuf]]
+  artCache: Table[int, ArtFiles] ## the on-disk picture listing, per app id
   galleryScroll: ScrollMemory = newScrollMemory()
   toasts: ToastQueue = newToastQueue()
 
@@ -128,8 +129,13 @@ proc toggleGenre(app: AppState; genre: string) =
   app.resetBrowse()
 
 proc reload(app: AppState) =
+  ## Read the catalogue again from disk. Reopening can change which pictures a
+  ## game has, so the decoded pictures and the on-disk listing are both dropped.
   app.catalog = loadCatalog(app.catalog.paths)
   app.pictures.clear()
+  app.artCache.clear()
+  app.selected = none(Release)
+  app.viewer = none(int)
   app.refreshItems()
 
 proc picture(app: AppState; path: string; width: int): Option[Pixbuf] =
@@ -154,7 +160,12 @@ proc openGame(app: AppState; release: Release) =
   app.viewer = none(int)
 
 proc gameArt(app: AppState; release: Release): ArtFiles =
-  app.catalog.artFiles(release.appid.get(0))
+  ## Cache the on-disk listing for the session: `artFiles` walks the game's
+  ## directory, and every tile asks for it on every redraw.
+  let appid = release.appid.get(0)
+  if not app.artCache.hasKey(appid):
+    app.artCache[appid] = app.catalog.artFiles(appid)
+  result = app.artCache[appid]
 
 func banner(art: ArtFiles): Option[string] =
   # Prefer page art; the store header is only 460×215.
@@ -186,9 +197,18 @@ proc rateGame(app: AppState; release: Release; verdict: Verdict) =
   else:
     app.toasts.add(newToast("Rating wasn’t saved. Check that your ratings file is writable and try again."))
 
+proc goBack(app: AppState) =
+  ## One step back: the picture viewer closes before the game page does, so the
+  ## header never needs a second navigation control. The back button and the
+  ## Escape shortcut share this.
+  if app.viewer.isSome:
+    app.closeViewer()
+  else:
+    app.selected = none(Release)
+
 proc backButton(app: AppState): Widget =
-  ## One button steps back one level: it closes the picture viewer before it
-  ## leaves the game, so the header never needs a second navigation control.
+  ## The one visible step back. Its shortcut is fixed: Owlkettle asserts that a
+  ## button's shortcut never changes after it is built.
   let viewing = app.viewer.isSome
   result = gui:
     Button:
@@ -197,11 +217,7 @@ proc backButton(app: AppState): Widget =
                 else: "Back to Games (Alt+Left)"
       style = [ButtonFlat]
       shortcut = "<Alt>Left"
-      proc clicked() =
-        if app.viewer.isSome:
-          app.closeViewer()
-        else:
-          app.selected = none(Release)
+      proc clicked() = app.goBack()
 
 proc searchToggle(app: AppState): Widget =
   result = gui:
@@ -249,7 +265,7 @@ proc filterMenu(app: AppState): Widget =
       tooltip = filterTooltip(app.filters)
       style = [ButtonFlat]
       Box(orient = OrientX, spacing = 6):
-        Label:
+        Label {.expand: false.}:
           text = if filtersActive(app.filters): "Filters (" & $filterCount(app.filters) & ")"
                  else: "Filters"
         Icon {.expand: false.}:
@@ -296,31 +312,64 @@ proc viewerTitle(app: AppState): string =
     return "Ludex"
   $min(app.viewer.get + 1, count) & " of " & $count
 
+proc headerTitle(app: AppState): string =
+  ## The header names the view being shown, per the HIG's browsing guidance.
+  if app.selected.isSome:
+    if app.viewer.isSome: app.viewerTitle()
+    else: app.selected.get.title
+  elif app.searching: "Search Results"
+  else: "Ludex"
+
+proc headerSubtitle(app: AppState): string =
+  if app.selected.isSome or not app.catalog.hasGames():
+    return ""
+  let count = app.items.len
+  if filtersActive(app.filters):
+    result = $count & (if count == 1: " game matches your filters"
+                       else: " games match your filters")
+  elif count == 1:
+    result = "1 game"
+  else:
+    result = $count & " games"
+
 proc header(app: AppState): Widget =
   ## The header follows the view. The primary menu belongs to the top level, so
   ## it is hidden while reading a game, as the HIG requires of a window with
   ## hierarchical navigation.
+  ##
+  ## Each slot is a `Box` that is always present; the control it may hold is
+  ## added and removed inside it. A fixed set of slot types is what keeps the
+  ## header from swapping a `Button` for a `ToggleButton` at one index, the
+  ## Owlkettle trap AGENTS.md records.
   result = gui:
     AdwHeaderBar:
       WindowTitle {.addTitle.}:
-        title = if app.selected.isNone and app.searching: "Search Results"
-                else: app.viewerTitle()
-        subtitle = if app.selected.isNone and app.catalog.hasGames():
-                     $app.items.len & " games"
-                   else: ""
-      if app.selected.isSome:
-        insert(backButton(app)) {.addLeft.}
-      else:
-        insert(searchToggle(app)) {.addLeft.}
-        if app.catalog.hasGames():
-          insert(filterMenu(app)) {.addLeft.}
-          if filtersActive(app.filters):
-            Button {.addLeft.}:
-              icon = "edit-clear-symbolic"
-              tooltip = "Clear Filters"
-              style = [ButtonFlat]
-              proc clicked() = app.clearFilters()
-        insert(mainMenu(app)) {.addRight.}
+        title = headerTitle(app)
+        subtitle = headerSubtitle(app)
+      Box {.addLeft.}:
+        orient = OrientX
+        if app.selected.isSome:
+          insert(backButton(app))
+      Box {.addLeft.}:
+        orient = OrientX
+        if app.selected.isNone:
+          insert(searchToggle(app))
+      Box {.addLeft.}:
+        orient = OrientX
+        if app.selected.isNone and app.catalog.hasGames():
+          insert(filterMenu(app))
+      Box {.addLeft.}:
+        orient = OrientX
+        if app.selected.isNone and app.catalog.hasGames() and filtersActive(app.filters):
+          Button:
+            icon = "edit-clear-symbolic"
+            tooltip = "Clear Filters"
+            style = [ButtonFlat]
+            proc clicked() = app.clearFilters()
+      Box {.addRight.}:
+        orient = OrientX
+        if app.selected.isNone:
+          insert(mainMenu(app))
 
 proc searchField(app: AppState): Widget =
   result = gui:
@@ -721,9 +770,11 @@ proc viewer(app: AppState): Widget =
   let index = max(0, min(items.len - 1, app.viewer.get(0)))
   if items.len == 0:
     return gui:
-      StatusPage:
-        iconName = "image-missing-symbolic"
-        title = "No Screenshots"
+      Box(orient = OrientY):
+        style = [Osd]
+        StatusPage:
+          iconName = "image-missing-symbolic"
+          title = "No Screenshots"
   let image = app.picture(items[index], 0)
   result = gui:
     Box(orient = OrientY):
@@ -740,10 +791,10 @@ proc viewer(app: AppState): Widget =
             description = "This screenshot could not be read."
         if items.len > 1:
           insert(navButton(app, "go-previous-symbolic",
-            "Previous Picture (Left Arrow)", "<Left>", -1)) {.addOverlay,
+            "Previous Picture (Page Up)", "<PageUp>", -1)) {.addOverlay,
               hAlign: AlignStart, vAlign: AlignCenter.}
           insert(navButton(app, "go-next-symbolic",
-            "Next Picture (Right Arrow)", "<Right>", 1)) {.addOverlay,
+            "Next Picture (Page Down)", "<PageDown>", 1)) {.addOverlay,
               hAlign: AlignEnd, vAlign: AlignCenter.}
 
 proc chooseCatalog(app: AppState) =
@@ -765,7 +816,12 @@ proc chooseCatalog(app: AppState) =
       if loaded.hasGames():
         app.catalog = loaded
         app.pictures.clear()
+        app.artCache.clear()
+        app.selected = none(Release)
+        app.viewer = none(int)
         app.closeSearch()
+      elif loaded.problems.len > 0:
+        app.toasts.add(newToast("No games could be read: " & loaded.problems[0]))
       else:
         app.toasts.add(newToast("No games could be read. Choose a Ludex catalogue file and try again."))
 
@@ -810,6 +866,17 @@ proc page(content: Widget): Widget =
       style = [StyleClass("background")]
       insert(content)
 
+proc library(app: AppState): Widget =
+  ## The collection keeps one stable `Box` as the `Overlay` child, so the slot
+  ## never changes renderable type when the results empty out. While a game or
+  ## picture page is open the box is insensitive, which takes the covered tiles
+  ## out of the keyboard and screen-reader focus chain; the opaque page still
+  ## hides them visually.
+  result = gui:
+    Box(orient = OrientY):
+      sensitive = app.selected.isNone
+      insert(collection(app))
+
 method view(app: AppState): Widget =
   when defined(ludexSnapshot):
     app.applyScene()
@@ -823,11 +890,14 @@ method view(app: AppState): Widget =
           if app.searching and app.selected.isNone:
             insert(searchField(app)) {.addTop.}
           Overlay:
-            insert(collection(app))
+            insert(library(app))
             if app.selected.isSome:
               insert(page(game(app))) {.addOverlay.}
-            if app.viewer.isSome and app.selected.isSome:
-              insert(page(viewer(app))) {.addOverlay.}
+              KeyShortcut {.addOverlay.}:
+                shortcut = "<Escape>"
+                proc clicked() = app.goBack()
+              if app.viewer.isSome:
+                insert(page(viewer(app))) {.addOverlay.}
 
 when defined(ludexSnapshot):
   var

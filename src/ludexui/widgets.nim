@@ -1,13 +1,10 @@
 ## Small native interaction bridges missing from Owlkettle's public widgets.
-## Search takes focus when mapped; collection scrolling survives a detail visit.
-## Adjustment signals deliberately avoid redraws while the user scrolls.
+## Search takes focus when mapped; a changed collection starts at the top;
+## a page can answer one key without spending a visible control on it.
 
 import owlkettle
 import owlkettle/bindings/gtk
 
-proc gtk_adjustment_get_value(adjustment: GtkAdjustment): cdouble {.importc, cdecl.}
-proc gtk_adjustment_get_upper(adjustment: GtkAdjustment): cdouble {.importc, cdecl.}
-proc gtk_adjustment_get_page_size(adjustment: GtkAdjustment): cdouble {.importc, cdecl.}
 proc gtk_label_set_max_width_chars(label: GtkWidget; chars: cint)
   {.importc, cdecl.}
 
@@ -43,7 +40,11 @@ renderable CheckedMenuItem of ModelButton:
       g_value_unset(value.addr)
 
 type ScrollMemory* = ref object
-  position: float
+  ## Tracks when a view's content changes so it can start at the top again. The
+  ## collection is never unmounted while browsing, so GTK already restores its
+  ## own scroll offset on return; only a new search, filter or page needs a
+  ## reset. Keeping no offset here is what avoids depending on the adjustment
+  ## `upper` before the first layout pass.
   generation: int
 
 proc newScrollMemory*(): ScrollMemory =
@@ -52,7 +53,6 @@ proc newScrollMemory*(): ScrollMemory =
 
 proc reset*(memory: ScrollMemory) =
   ## New search results or a new page begin at the top.
-  memory.position = 0
   inc memory.generation
 
 renderable FocusSearchEntry of SearchEntry:
@@ -70,41 +70,32 @@ renderable FocusSearchEntry of SearchEntry:
         g_signal_handler_disconnect(pointer(state.internalWidget), state.mapHandler)
 
 renderable RememberedScroll of ScrolledWindow:
+  ## A ScrolledWindow that jumps back to the top when its `memory` generation
+  ## changes. It keeps no offset deliberately: the collection stays mounted
+  ## under the game and viewer pages, so GTK restores its position on return.
   memory: ScrollMemory
-  adjustment {.private, onlyState.}: GtkAdjustment
-  changedHandler {.private, onlyState.}: culong
-  valueHandler {.private, onlyState.}: culong
   generation {.private, onlyState.}: int
-  restoring {.private, onlyState.}: bool
 
   hooks:
     beforeBuild:
       state.internalWidget = gtk_scrolled_window_new(nil.GtkAdjustment, nil.GtkAdjustment)
     afterBuild:
-      state.adjustment = gtk_scrolled_window_get_vadjustment(state.internalWidget)
       state.generation = state.memory.generation
-      state.restoring = true
-      proc changed(adjustment: GtkAdjustment; data: pointer) {.cdecl.} =
-        let state = cast[ptr RememberedScrollStateObj](data)
-        if state.restoring and gtk_adjustment_get_upper(adjustment) > 0:
-          let position = min(state.memory.position,
-            max(0.0, gtk_adjustment_get_upper(adjustment) -
-              gtk_adjustment_get_page_size(adjustment)))
-          gtk_adjustment_set_value(adjustment, position)
-          state.restoring = false
-      proc valueChanged(adjustment: GtkAdjustment; data: pointer) {.cdecl.} =
-        let state = cast[ptr RememberedScrollStateObj](data)
-        if not state.restoring and state.generation == state.memory.generation:
-          state.memory.position = gtk_adjustment_get_value(adjustment)
-      state.changedHandler = g_signal_connect(pointer(state.adjustment), "changed",
-        changed, addr state[])
-      state.valueHandler = g_signal_connect(pointer(state.adjustment), "value-changed",
-        valueChanged, addr state[])
     update:
       if state.generation != state.memory.generation:
         state.generation = state.memory.generation
-        gtk_adjustment_set_value(state.adjustment, 0)
-    destroy:
-      if state.changedHandler != 0:
-        g_signal_handler_disconnect(pointer(state.adjustment), state.changedHandler)
-        g_signal_handler_disconnect(pointer(state.adjustment), state.valueHandler)
+        gtk_adjustment_set_value(
+          gtk_scrolled_window_get_vadjustment(state.internalWidget), 0)
+
+renderable KeyShortcut of Button:
+  ## A `Button` that exists only to carry a keyboard shortcut. Owlkettle's own
+  ## `Button.shortcut` installs the window-managed controller and `clicked` is
+  ## the callback, so this renderable adds no GTK code of its own; it hides its
+  ## button in `afterBuild` so no visible control appears. A hidden widget stays
+  ## rooted, and a managed shortcut controller is registered with the window's
+  ## shortcut manager, so the key still fires.
+  hooks:
+    beforeBuild:
+      state.internalWidget = gtk_button_new()
+    afterBuild:
+      gtk_widget_hide(state.internalWidget)

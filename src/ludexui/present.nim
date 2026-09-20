@@ -227,6 +227,7 @@ func plainText*(text: string): string =
   ## Steam's prose carries a little HTML and HTML entities and the window shows it
   ## in a plain label, so tags are dropped and entities decoded. Runs of
   ## whitespace collapse to one space, because the source is full of newlines.
+  ## An unterminated `<` stays as text instead of swallowing the rest.
   var index = 0
   while index < text.len:
     let character = text[index]
@@ -234,8 +235,12 @@ func plainText*(text: string): string =
       var close = index
       while close < text.len and text[close] != '>':
         inc close
-      result.add ' '
-      index = close + 1
+      if close < text.len:
+        result.add ' '
+        index = close + 1
+      else:
+        result.add character
+        inc index
     elif character == '&':
       let semicolon = text.find(';', index)
       if semicolon > index and semicolon - index <= 8:
@@ -243,9 +248,12 @@ func plainText*(text: string): string =
         if decoded.len > 0:
           result.add decoded
           index = semicolon + 1
-          continue
-      result.add character
-      inc index
+        else:
+          result.add character
+          inc index
+      else:
+        result.add character
+        inc index
     else:
       result.add character
       inc index

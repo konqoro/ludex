@@ -174,8 +174,9 @@ siblings: neither imports the other.
 18. **Do not reparent a viewable's content between widget types.** Swapping the content
     child of a `ToolbarView` between two different renderables makes Owlkettle reuse and
     then disconnect a state whose event was never connected, which trips
-    `assert event.handler > 0` in `widgetutils.nim`. Both the viewer swap and the header's
-    changing button survive this today, but keep the branch shallow.
+    `assert event.handler > 0` in `widgetutils.nim`. A page placeholder and the header
+    both used to swap types at one fixed slot; they are now wrapped so a slot keeps one
+    renderable type (`app.library` and the header's `Box` slots). Keep the branch shallow.
 19. **`ModelButton.icon` is not a checkmark.** Owlkettle implements `icon` by setting GTK's
     `iconic` *as well as* the icon, and `GtkModelButton` in iconic mode hides the label:
     `ModelButton: icon = "object-select-symbolic"` renders a lone tick with no text. A real
@@ -188,9 +189,9 @@ siblings: neither imports the other.
     not.** There is no funnel anywhere under `/usr/share/icons` here, and a missing name
     silently renders GTK's blank "broken image" placeholder, which reads as a blank
     button. Check before using a name:
-    `find /usr/share/icons -name '<name>.svg'`. In use today: `view-more-symbolic` for the
-    filter menu (GNOME's secondary-menu icon), `action-unavailable-symbolic` for the
-    filtered-to-nothing page, `starred-symbolic` for a loved tile.
+    `find /usr/share/icons -name '<name>.svg'`. In use today: `pan-down-symbolic` for the
+    filter menu's chevron (a labelled button, not a funnel), `action-unavailable-symbolic`
+    for the filtered-to-nothing page, `starred-symbolic` for a loved tile.
 
 ### `relay` gotchas (the HTTP client's own surprises)
 
