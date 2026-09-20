@@ -339,9 +339,9 @@ the fallback path for rows without the marker.
    `confidence < 0.6` and are surfaced in a `ludex review-matches` queue for a human
    decision — never silently guessed. Collections get one key plus child keys.
 
-### 7.4 Fetch (implemented: `src/ludexingest/client.nim`)
+### 7.4 Fetch (implemented: `src/ludexingest/fetch.nim`)
 
-One caching, rate-limited client, with no HTTP dependency beyond `std/httpclient` and
+One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), with
 `-d:ssl`:
 
 - **Cache.** One file per URL, named after the sanitized URL so a cache directory stays
@@ -357,16 +357,36 @@ One caching, rate-limited client, with no HTTP dependency beyond `std/httpclient
   reported this game" and is worth remembering instead of re-asking. A corrupt cache file
   is a miss, not an exception. `--refresh` ignores the cache; `--offline` never opens a
   socket and fails on a miss, which is what the tests use.
-- **Politeness.** An unconditional pause between requests (`--delay`, default 250 ms), a
-  descriptive `User-Agent` with a contact URL, and a hard `--limit` so a sweep can be
-  partial. Retries `429` and `5xx` with exponential backoff, then gives up on that game.
+- **Politeness.** A *pacer* holds each request back until `--delay` (default 250 ms,
+  per-source) has elapsed since the previous submission, so a source publishing a request
+  budget sees a fixed rate whether the sweep is ten URLs or four thousand. A hard `--limit`
+  makes a sweep partial. A descriptive `User-Agent` with a contact URL. Retries `429` and
+  `5xx` with exponential backoff, then gives up on that game.
+- **Overlap, not a rate limit.** A concurrency bound and a rate limit are different
+  promises. `relay`'s `maxInFlight` (four) says "no more than four sockets open"; it does
+  not stop four fast answers from arriving in a burst, which is what gets an address
+  throttled. So `fetchAll` streams URLs through the pacer one submission at a time and
+  drains completions as they arrive. The delay is a floor, and `maxInFlight` only hides
+  the latency of a slow source when the answer takes longer than the delay. This is why the
+  batch is not handed to `relay` at once: that would defeat the pacer.
 - **Failure handling.** Any per-game failure is recorded with its reason and the run
-  continues. The client's own errors are `FetchError`; `httpclient` declares `Exception`
-  for its TLS paths, which is translated there and only there, with `Defect` re-raised so
-  a programming bug is never recorded as a source outage.
+  continues; `fetchAll` returns an outcome per URL, so an answer and its absence never
+  occupy separate parallel arrays. The client's own error is `FetchError`; `relay`'s
+  transport errors are values and its lifecycle errors are `IOError`, translated to
+  `FetchError` at this boundary and only here, with `Defect` re-raised so a programming bug
+  is never recorded as a source outage.
+- **Cost of the dependency.** `relay` shares `ref` objects across its worker thread, so it
+  requires `--threads:on` and `--mm:atomicArc`, and it binds libcurl without linking it.
+  Nim has no per-module memory model and `nimble`/Atlas do not propagate a dependency's
+  `config.nims`, so those four settings live in `nim.cfg`'s user section (`-lcurl`,
+  `-DCURL_DISABLE_TYPECHECK` for the Fedora curl 8.16+ header bug) and apply to the whole
+  build, including the UI that never opens a socket. That is a known, accepted cost.
 - **Still to come:** ETag/Last-Modified revalidation and `--max-age` (the cache is
-  currently valid until `--refresh`), per-host token buckets, and resumable job state.
-  OpenCritic at 200/day stays an on-demand source, never a bulk one.
+  currently valid until `--refresh`), and a token bucket in place of the fixed pacer so a
+  short burst is allowed within a longer average budget. `ludex art` still fetches one
+  picture at a time: batching it would hold every image body in memory, so it needs a
+  chunked stream before it can use `fetchAll`. OpenCritic at 200/day stays an on-demand
+  source, never a bulk one.
 
 ### 7.5 What ProtonDB actually returns (implemented)
 
@@ -826,7 +846,7 @@ ludex/
       steamdeck.nim             # Deck and SteamOS verdicts       [done]
       steamspy.nim              # tags, ownership, player counts  [done]
     ludexingest/                # IO: fetch, cache, rate limit
-      client.nim                # caching, rate-limited HTTP     [done]
+      fetch.nim                 # caching, paced HTTP (relay)     [done]
       enrich.nim                # fetch, decode, merge, record   [done]
       artcache.nim              # pictures into data/art/<appid> [done]
     ludex.nim                   # CLI                           [done]
@@ -897,9 +917,10 @@ Other notes:
   are compared with a tolerance in the tests instead. Upstream's master branch reworked
   float conversion, so this is worth rechecking when brian is next updated.
 - System Nim is 2.3.1, and the build target is the C backend (`nim c`), not JavaScript.
-- HTTP uses `std/httpclient` with `-d:ssl`; there is no third-party HTTP dependency.
-  `-d:ssl` lives in the user section of `nim.cfg`, because every enrichment source is
-  HTTPS only and a CLI built without it fails every request at runtime.
+- `fetch.nim` uses `relay` (libcurl multi) with `-d:ssl`; `-d:ssl` and the four Relay
+  build settings (`--threads:on`, `--mm:atomicArc`, `-lcurl`, `-DCURL_DISABLE_TYPECHECK`)
+  live in the user section of `nim.cfg`, because every enrichment source is HTTPS only and
+  a CLI built without them fails every request at runtime. See section 7.4.
 - The owlkettle UI links GTK4 4.22 and libadwaita 1.9 through `pkg-config`, which
   owlkettle's bindings run at compile time. The shared libraries are enough; no `-devel`
   headers are read, and owlkettle 3.1.0 compiles on system Nim 2.3.1 unchanged.

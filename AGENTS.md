@@ -66,14 +66,14 @@ siblings: neither imports the other.
 |---|---|---|
 | Core | `src/ludexcore/` | Pure. **No I/O, network, threads, or FFI.** String in, string out. |
 | Source decoders | `src/ludexcore/sources/` | Pure. Turn a recorded response body into facts. |
-| Ingest | `src/ludexingest/` | Owns HTTP, cache, rate limiting: `enrich.nim` for facts and `artcache.nim` for pictures. |
+| Ingest | `src/ludexingest/` | Owns HTTP, cache, rate limiting: `fetch.nim` for the client, `enrich.nim` for facts and `artcache.nim` for pictures. |
 | CLI | `src/ludex.nim` | Owns the file system and the network. |
 | UI | `src/ludexui/` | owlkettle/GTK4. `catalog.nim` owns the file system, `present.nim` is pure, `app.nim` is layout only. No network: enrichment and pictures are CLI jobs, the window reads what they wrote. |
 
 - `ludexcore` must not `import std/os`. This is why the tests need no fixtures on disk
   and run offline. If you need a file read, do it in `src/ludex.nim` or
   `src/ludexingest/` and pass strings down.
-- `client.nim` is the only module that performs network I/O (`std/httpclient`).
+- `fetch.nim` is the only module that performs network I/O. It uses `relay` (libcurl multi), whose four build settings are explained in `docs/DESIGN.md` §7.4. The per-source delay is a real rate limit applied per submission by a pacer, not a per-round sleep; `maxInFlight` only overlaps requests the pacer already admitted.
 - JSON is handled **exclusively by `brian`** — never `std/json`, never a DOM. `brian`
   decodes straight into Nim types and encodes straight into a string.
 - `ref object` is used only where identity matters (the in-memory game index, UI state).

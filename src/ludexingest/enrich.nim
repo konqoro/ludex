@@ -132,36 +132,36 @@ proc collect(known: Table[int, Enrichment]): seq[Enrichment] =
     result.add item
   result.sort(proc (a, b: Enrichment): int = cmp(a.appid, b.appid))
 
-proc steamFacts(client: Client; appid: int; country: string; refresh: bool;
+proc steamFacts(answers: openArray[FetchOutcome]; base: int; appid: int;
                 problems: var seq[string]): SteamFacts =
-  ## Asks Steam for one game's store entry, review summary and Deck report.
+  ## Turns one game's three pre-fetched answers into facts.
   ##
   ## The three calls are independent, and each failure is recorded but does not
   ## discard the others: a game whose store entry vanished can still have
   ## reviews, and losing two good answers because a third call timed out would
   ## waste the sweep. `problems` receives one line per failed call.
+  ##
+  ## The answers arrive already fetched, in details/reviews/deck order, because
+  ## the caller batches all three for every game at once. Decoding is the only
+  ## work left here, so a decode failure is the only thing this can report.
   template attempt(label: string; body: untyped) =
     try:
       body
-    except FetchError as error:
-      problems.add label & ": " & error.msg
     except CatchableError as error:
       problems.add label & " cannot decode: " & error.msg
 
   attempt "details":
-    let details = fetch(client, detailsUrl(appid, country), refresh)
-    if details.status == 200:
-      let app = decodeApp(details.body, appid)
+    if answers[base + 0].answer.isSome and answers[base + 0].answer.get.status == 200:
+      let app = decodeApp(answers[base + 0].answer.get.body, appid)
       if app.isSome:
         result = toSteamFacts(app.get, nowUnix())
   attempt "reviews":
-    let reviews = fetch(client, reviewsUrl(appid), refresh)
-    if reviews.status == 200:
-      result.reviews = toReviewScore(decodeReviews(reviews.body), nowUnix())
+    if answers[base + 1].answer.isSome and answers[base + 1].answer.get.status == 200:
+      result.reviews = toReviewScore(
+        decodeReviews(answers[base + 1].answer.get.body), nowUnix())
   attempt "deck":
-    let deck = fetch(client, deckUrl(appid), refresh)
-    if deck.status == 200:
-      let report = decodeDeck(deck.body)
+    if answers[base + 2].answer.isSome and answers[base + 2].answer.get.status == 200:
+      let report = decodeDeck(answers[base + 2].answer.get.body)
       if report.results.isSome:
         let deckResults = report.results.get
         result.deck = toVerdict(deckResults.deckCategory, nowUnix())
@@ -176,23 +176,39 @@ proc enrichSteam*(client: Client; releases: openArray[Release];
   ## compatibility report. A game Steam has no entry for is counted as silent and
   ## keeps whatever it already had.
   var known = indexByAppId(existing)
+  var asked: seq[int] = @[]
   for appid in appIdsOf(releases):
-    if limit > 0 and result.stats.asked >= limit:
+    if limit > 0 and asked.len >= limit:
       break
-    inc result.stats.asked
-    var problems: seq[string] = @[]
-    let facts = steamFacts(client, appid, country, refresh, problems)
-    for problem in problems:
+    asked.add appid
+  result.stats.asked = asked.len
+
+  # Three URLs per game, all known up front, so the whole sweep is one batch
+  # rather than three serial round trips per game.
+  var urls = newSeq[string](asked.len * 3)
+  for i, appid in asked:
+    urls[i * 3] = detailsUrl(appid, country)
+    urls[i * 3 + 1] = reviewsUrl(appid)
+    urls[i * 3 + 2] = deckUrl(appid)
+  let answers = fetchAll(client, urls, refresh)
+
+  for i, appid in asked:
+    var gameProblems: seq[string] = @[]
+    for k in 0..2:
+      if answers[i * 3 + k].answer.isNone:
+        gameProblems.add answers[i * 3 + k].problem
+    let facts = steamFacts(answers, i * 3, appid, gameProblems)
+    for problem in gameProblems:
       result.stats.failures.add($appid & " " & problem)
     if facts.isKnown:
-      if problems.len > 0:
+      if gameProblems.len > 0:
         inc result.stats.partial
       else:
         inc result.stats.answered
       let base = known.getOrDefault(appid, initEnrichment(appid))
       known[appid] = Enrichment(appid: appid, play: base.play,
                                 store: mergeSteamFacts(base.store, facts))
-    elif problems.len > 0:
+    elif gameProblems.len > 0:
       inc result.stats.failed
     else:
       inc result.stats.silent
@@ -208,20 +224,29 @@ proc enrichSteamSpy*(client: Client; releases: openArray[Release];
   ## One request per game. SteamSpy refreshes its data once a day, so a repeat
   ## run inside a day is answered from the cache and is worth nothing anyway.
   var known = indexByAppId(existing)
+  var asked: seq[int] = @[]
   for appid in appIdsOf(releases):
-    if limit > 0 and result.stats.asked >= limit:
+    if limit > 0 and asked.len >= limit:
       break
-    inc result.stats.asked
+    asked.add appid
+  result.stats.asked = asked.len
+
+  # One batch for the whole run: every URL is known up front, so the requests
+  # overlap instead of each waiting on the last.
+  var urls = newSeq[string](asked.len)
+  for i, appid in asked:
+    urls[i] = spyUrl(appid)
+  let answers = fetchAll(client, urls, refresh)
+
+  for i, appid in asked:
     var facts = SteamFacts()
-    var problem = ""
-    try:
-      let fetched = fetch(client, spyUrl(appid), refresh)
-      if fetched.status == 200:
-        facts = toSteamFacts(decodeSpyApp(fetched.body), nowUnix())
-    except FetchError as error:
-      problem = error.msg
-    except CatchableError as error:
-      problem = "cannot decode: " & error.msg
+    var problem = answers[i].problem
+    if problem.len == 0:
+      try:
+        if answers[i].answer.get.status == 200:
+          facts = toSteamFacts(decodeSpyApp(answers[i].answer.get.body), nowUnix())
+      except CatchableError as error:
+        problem = "cannot decode: " & error.msg
     if problem.len > 0:
       inc result.stats.failed
       result.stats.failures.add($appid & ": " & problem)
@@ -235,15 +260,6 @@ proc enrichSteamSpy*(client: Client; releases: openArray[Release];
 
   result.stats.cached = client.hits
   result.items = collect(known)
-
-proc summaryFacts(client: Client; appid: int;
-                  refresh: bool): Option[Playability] =
-  ## Asks ProtonDB about one app id. `none` means the source knows nothing.
-  let fetched = fetch(client, summaryUrl(appid), refresh)
-  if fetched.status != 200:
-    result = none(Playability)
-  else:
-    result = some toPlayability(decodeSummary(fetched.body), nowUnix())
 
 proc applyFacts(known: var Table[int, Enrichment]; updates: openArray[Release];
                 facts: Table[int, Playability]): RunStats =
@@ -291,19 +307,31 @@ proc enrichSummary*(client: Client; releases: openArray[Release];
   ## polite partial sweep possible. Records for app ids that were not asked
   ## about are passed through untouched.
   var known = indexByAppId(existing)
+  var asked: seq[int] = @[]
   for appid in appIdsOf(releases):
-    if limit > 0 and result.stats.asked >= limit:
+    if limit > 0 and asked.len >= limit:
       break
-    inc result.stats.asked
+    asked.add appid
+  result.stats.asked = asked.len
+
+  # One batch for the whole run: every URL is known up front, so the requests
+  # overlap instead of each waiting on the last.
+  var urls = newSeq[string](asked.len)
+  for i, appid in asked:
+    urls[i] = summaryUrl(appid)
+  let answers = fetchAll(client, urls, refresh)
+
+  for i, appid in asked:
     var update = none(Playability)
-    var problem = ""
+    var problem = answers[i].problem
     # Any per-game failure is recoverable: the run records it and moves on.
-    try:
-      update = summaryFacts(client, appid, refresh)
-    except FetchError as error:
-      problem = error.msg
-    except CatchableError as error:
-      problem = "cannot decode: " & error.msg
+    if problem.len == 0:
+      try:
+        if answers[i].answer.get.status == 200:
+          update = some toPlayability(decodeSummary(answers[i].answer.get.body),
+                                      nowUnix())
+      except CatchableError as error:
+        problem = "cannot decode: " & error.msg
     if problem.len > 0:
       inc result.stats.failed
       result.stats.failures.add($appid & ": " & problem)
