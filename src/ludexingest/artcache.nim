@@ -42,14 +42,10 @@ type
     ## What one sweep did, in the same spirit as `RunStats`.
     games*: int ## games that had a picture to fetch
     fetched*: int ## images written this run
-    cached*: int ## pictures answered from the cache rather than the network
     skipped*: int ## images already on disk
     failed*: int
     failures*: seq[string] ## `<appid>: <file>: <reason>`, kept per image
-    requests*: int ## pictures asked for over the network, cache hits excluded
-    retries*: int ## pictures that were not fetched on the first attempt
-    cacheErrors*: int ## responses that could not be written to the cache
-    elapsedMs*: int64
+    sweep*: SweepStats ## the HTTP cost of the sweep
 
   Target = object
     ## One picture the sweep owes: where it goes, and which game it belongs to.
@@ -132,8 +128,4 @@ proc fetchArt*(client: Client; items: openArray[Enrichment]; root: string;
       result.failures.add $target.appid & ": " & target.name & ": " &
         failureReason(picture)
 
-  result.requests = sweep.stats.requests
-  result.cached = sweep.stats.cached
-  result.retries = sweep.stats.retries
-  result.cacheErrors = sweep.stats.cacheErrors
-  result.elapsedMs = sweep.stats.elapsedMs
+  result.sweep = sweep.stats

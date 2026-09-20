@@ -30,11 +30,7 @@ type
     asked*: int ## app ids the source was queried about
     answered*: int ## app ids the source had data for
     silent*: int ## app ids the source answered "nothing known" for
-    cached*: int ## answers served from the cache
-    requests*: int ## HTTP requests this run sent, cache hits excluded
-    retries*: int ## submissions that were not a URL's first attempt
-    cacheErrors*: int ## answers that could not be written to the cache
-    elapsedMs*: int64 ## wall clock the fetching took
+    sweep*: SweepStats ## the HTTP cost of the run
     failed*: int ## app ids nothing could be fetched for at all
     partial*: int ## app ids where some calls failed and others answered
     failures*: seq[string] ## `<appid>: <reason>`
@@ -137,18 +133,6 @@ proc collect(known: Table[int, Enrichment]): seq[Enrichment] =
     result.add item
   result.sort(proc (a, b: Enrichment): int = cmp(a.appid, b.appid))
 
-proc recordBatch(stats: var RunStats; swept: SweepStats) =
-  ## Copies one batch's cost into the run's report.
-  ##
-  ## The client's own counters are session totals: they were only ever the right
-  ## number to print because the CLI makes one client per command. A run's cost
-  ## is the run's, and a batch is a run.
-  stats.cached = swept.cached
-  stats.requests = swept.requests
-  stats.retries = swept.retries
-  stats.cacheErrors = swept.cacheErrors
-  stats.elapsedMs = swept.elapsedMs
-
 proc steamFacts(answers: openArray[FetchOutcome]; base: int; appid: int;
                 problems: var seq[string]): SteamFacts =
   ## Turns one game's three pre-fetched answers into facts.
@@ -231,7 +215,7 @@ proc enrichSteam*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.recordBatch(swept.stats)
+  result.stats.sweep = swept.stats
   result.items = collect(known)
 
 proc enrichSteamSpy*(client: Client; releases: openArray[Release];
@@ -277,7 +261,7 @@ proc enrichSteamSpy*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.recordBatch(swept.stats)
+  result.stats.sweep = swept.stats
   result.items = collect(known)
 
 proc applyFacts(known: var Table[int, Enrichment]; updates: openArray[Release];
@@ -321,7 +305,7 @@ proc enrichAntiCheat*(client: Client; releases: openArray[Release];
                                              else:
                                                "HTTP " &
                                                $answer.answer.get.status)
-  result.stats.recordBatch(swept.stats)
+  result.stats.sweep = swept.stats
   result.items = collect(known)
 
 proc enrichSummary*(client: Client; releases: openArray[Release];
@@ -371,7 +355,7 @@ proc enrichSummary*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.recordBatch(swept.stats)
+  result.stats.sweep = swept.stats
   result.items = collect(known)
 
 proc enrich*(client: Client; source: SourceKind; releases: openArray[Release];

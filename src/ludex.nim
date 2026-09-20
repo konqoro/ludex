@@ -595,10 +595,11 @@ proc commandEnrich(request: Request) =
 
   writeText(outPath, encodeEnrichments(run.items))
   echo run.stats.asked, " asked, ", run.stats.answered, " answered, ",
-    run.stats.silent, " silent, ", run.stats.cached, " from cache, ",
+    run.stats.silent, " silent, ", run.stats.sweep.cached, " from cache, ",
     run.stats.partial, " partial, ", run.stats.failed, " failed"
-  echo run.stats.requests, " requests in ", formatDuration(run.stats.elapsedMs)
-  reportPoliteness(run.stats.retries, run.stats.cacheErrors)
+  echo run.stats.sweep.requests, " requests in ",
+    formatDuration(run.stats.sweep.elapsedMs)
+  reportPoliteness(run.stats.sweep.retries, run.stats.sweep.cacheErrors)
   for failure in run.stats.failures:
     stderr.writeLine("ludex: " & failure)
   echo "wrote ", outPath
@@ -633,10 +634,11 @@ proc commandArt(request: Request) =
     client.close()
 
   echo stats.games, " games, ", stats.fetched, " images written, ",
-    stats.cached, " from cache, ", stats.skipped, " already here, ",
+    stats.sweep.cached, " from cache, ", stats.skipped, " already here, ",
     stats.failed, " failed"
-  echo stats.requests, " requests in ", formatDuration(stats.elapsedMs)
-  reportPoliteness(stats.retries, stats.cacheErrors)
+  echo stats.sweep.requests, " requests in ",
+    formatDuration(stats.sweep.elapsedMs)
+  reportPoliteness(stats.sweep.retries, stats.sweep.cacheErrors)
   for failure in stats.failures:
     stderr.writeLine("ludex: " & failure)
   echo "wrote ", artRoot

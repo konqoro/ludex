@@ -106,7 +106,7 @@ block pipeline_answers_and_silence:
   doAssert run.stats.asked == 3, "the game without an app id is not asked about"
   doAssert run.stats.answered == 2
   doAssert run.stats.silent == 1
-  doAssert run.stats.cached == 3
+  doAssert run.stats.sweep.cached == 3
   doAssert run.stats.failed == 0
   doAssert run.items.len == 2, "nothing is stored for a game nobody reported"
 
@@ -324,7 +324,7 @@ block steam_needs_two_calls_per_game:
   doAssert run.stats.asked == 3
   doAssert run.stats.answered == 2
   doAssert run.stats.silent == 1, "an app Steam has no entry for is not a failure"
-  doAssert run.stats.cached == 9, "three answers per game"
+  doAssert run.stats.sweep.cached == 9, "three answers per game"
   doAssert run.stats.failed == 0
   doAssert run.items.len == 2
 
@@ -507,7 +507,7 @@ block steamspy_tags_and_counts:
   doAssert run.stats.asked == 3
   doAssert run.stats.answered == 2
   doAssert run.stats.silent == 1, "an untracked app is silence, not a failure"
-  doAssert run.stats.cached == 3
+  doAssert run.stats.sweep.cached == 3
   doAssert run.stats.failed == 0
 
   var byId = initTable[int, Enrichment]()
