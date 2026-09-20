@@ -24,12 +24,12 @@
 
 import std/[options, os, strutils]
 
-when defined(posix):
-  proc cRename(source, dest: cstring): cint {.importc: "rename",
-    header: "<stdio.h>".}
-    ## `rename(2)`, the only way to publish a file atomically. Nim's `moveFile`
-    ## would do the same, but its effect signature includes `Exception`, which is
-    ## wider than this module's contract can allow.
+proc cRename(source, dest: cstring): cint {.importc: "rename",
+  header: "<stdio.h>".}
+  ## `rename(2)`, which publishes the temporary file atomically and overwrites on
+  ## POSIX. Nim's `moveFile` would be portable, but its effect signature includes
+  ## `Exception`, which is wider than this module's contract can allow, and the
+  ## project targets Linux.
 
 const MaxNameLength = 180
 
@@ -107,12 +107,11 @@ proc writeCacheEntry*(dir, url: string; status: int; body: string)
   ## The bytes are written beside the final name and renamed into place, so a run
   ## killed mid-write cannot leave a truncated body that later reads back as an
   ## answer. The temporary name carries a `~`, which `cacheFileName` can never
-  ## produce, so no URL can look it up. Where no atomic rename is bound, the entry
-  ## is written in place and a torn write stays possible.
+  ## produce, so no URL can look it up.
   try:
     createDir(dir)
     let path = cachePath(dir, url)
-    let target = when defined(posix): path & "~tmp" else: path
+    let target = path & "~tmp"
     # Header and body are written separately: joining them would copy the whole
     # body (a picture is 50-200 KB, and a sweep is thousands of them) for a
     # string that exists only to be written out and dropped.
@@ -122,9 +121,8 @@ proc writeCacheEntry*(dir, url: string; status: int; body: string)
       file.write(body)
     finally:
       file.close()
-    when defined(posix):
-      if cRename(target.cstring, path.cstring) != 0:
-        raise newException(IOError, "cannot publish " & path & ": " &
-                           osErrorMsg(osLastError()))
+    if cRename(target.cstring, path.cstring) != 0:
+      raise newException(IOError, "cannot publish " & path & ": " &
+                         osErrorMsg(osLastError()))
   except CatchableError as error:
     raise newException(IOError, "cannot cache " & url & ": " & error.msg)
