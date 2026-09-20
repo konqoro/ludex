@@ -192,11 +192,12 @@ proc answerFromCache(sweep: var Sweep; item: Pending): bool {.raises: [].} =
   ## Answers one item from the cache when there is an entry, and says whether it
   ## did. A cache hit costs no request, so it is not paced. A cached transient
   ## (an old entry written before the write side refused to store one) is a miss.
+  result = false
   if sweep.refresh:
-    return false
+    return
   let cached = cache.readCacheEntry(sweep.client.cacheDir, item.url)
   if cached.isNone or isTransient(cached.get.status):
-    return false
+    return
   inc sweep.stats.cached
   sweep.ready.addLast(FetchOutcome(key: item.key, url: item.url,
     answer: some Fetch(status: cached.get.status, body: cached.get.body,
@@ -218,20 +219,16 @@ proc submit(sweep: var Sweep; item: sink Pending) {.raises: [].} =
   ## a fact about the sweep rather than an exception out of it.
   let requestId = sweep.client.nextRequestId
   inc sweep.client.nextRequestId
-  let started = try:
-                  sweep.client.http.startRequest(RequestSpec(
-                    verb: hvGet, url: item.url, headers: sweep.headers,
-                    requestId: requestId))
-                  true
-                except IOError as error:
-                  sweep.ready.addLast(FetchOutcome(key: item.key, url: item.url,
-                    problem: "GET " & item.url & ": " & error.msg))
-                  false
-  if started:
+  try:
+    sweep.client.http.startRequest(RequestSpec(
+      verb: hvGet, url: item.url, headers: sweep.headers, requestId: requestId))
     sweep.inFlight[requestId] = item
     inc sweep.stats.requests
     if item.attempt > 1:
       inc sweep.stats.retries
+  except IOError as error:
+    sweep.ready.addLast(FetchOutcome(key: item.key, url: item.url,
+      problem: "GET " & item.url & ": " & error.msg))
 
 proc take(sweep: var Sweep; item: sink RequestResult) {.raises: [].} =
   ## Files one finished request as an answer, a retry or a problem. Takes the
@@ -339,10 +336,10 @@ proc fetchAll*(client: Client; urls: openArray[string]; refresh = false):
   ## This holds every body in memory at once; `initSweep` and `next` are the
   ## streaming form for pictures.
   var sweep = initSweep(client, urls, refresh)
-  result.outcomes = newSeq[FetchOutcome](urls.len)
+  var outcomes = newSeq[FetchOutcome](urls.len)
   while true:
     let outcome = sweep.next()
     if outcome.isNone:
       break
-    result.outcomes[outcome.get.key] = outcome.get
-  result.stats = sweep.stats
+    outcomes[outcome.get.key] = outcome.get
+  result = SweepResult(outcomes: outcomes, stats: sweep.stats)

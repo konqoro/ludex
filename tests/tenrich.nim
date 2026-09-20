@@ -35,7 +35,7 @@ proc seed(client: Client; appid: int; status: int; body: string) =
 proc fetchOne(client: Client; url: string): Fetch =
   let swept = fetchAll(client, @[url])
   doAssert swept.outcomes[0].answer.isSome, swept.outcomes[0].problem
-  swept.outcomes[0].answer.get
+  result = swept.outcomes[0].answer.get
 
 block cache_file_names:
   doAssert cacheFileName("https://a/b.json") == "https___a_b.json"
