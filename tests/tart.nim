@@ -8,7 +8,7 @@
 import std/[options, os, strutils]
 
 import ludexcore/[art, models]
-import ludexingest/[artcache, client]
+import ludexingest/[artcache, fetch]
 
 const
   HeaderUrl = "https://example.test/store/header.jpg"

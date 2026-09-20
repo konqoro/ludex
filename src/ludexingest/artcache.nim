@@ -22,7 +22,7 @@ import std/[options, os]
 
 import ludexcore/[art, models]
 
-import client
+import fetch
 
 const
   DefaultArtDelayMs* = 100

@@ -14,7 +14,7 @@ import std/[algorithm, options, sets, tables, times]
 
 import ludexcore/[models, sources/awac, sources/protondb]
 import ludexcore/sources/[steamdeck, steamreviews, steamspy, steamstore]
-import ./client
+import ./fetch
 
 type
   SourceKind* = enum

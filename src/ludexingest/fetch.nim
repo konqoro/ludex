@@ -12,12 +12,35 @@
 ##   {"tier":"platinum","score":0.71,"total":31}
 ##
 ## This is the only module in the project that performs network I/O.
+##
+## ## Why batches
+##
+## The catalogue is 1545 games and Steam costs three requests each, so a serial
+## sweep is hours of wall clock spent waiting on sockets. Relay runs requests on
+## a libcurl multi handle, so the unit of work here is a *batch*: `fetchAll`
+## takes many URLs and returns one answer per URL, and `fetch` is the
+## single-URL case of it.
+##
+## ## Why the delay survives
+##
+## A concurrency bound and a rate limit are not the same promise. `maxInFlight`
+## says "no more than N sockets open"; it does not stop N fast answers from
+## arriving in a burst, which is exactly what gets an address throttled by a
+## source that publishes a request budget. So the per-source delay is kept as a
+## real rate limit: submissions are paced by it, and `maxInFlight` only decides
+## how many of those paced requests may overlap. A source with a 1600 ms budget
+## still sees one request per 1600 ms; it just no longer waits for each answer
+## before sending the next.
 
-import std/[httpclient, options, os, strutils]
+import std/[options, os, strutils]
+import relay
 
 const DefaultAgent* = "ludex/0.1 (+https://github.com/ageralis/ludex)"
 const DefaultDelayMs* = 250
 const MaxAttempts = 4
+const DefaultMaxInFlight* = 4
+  ## How many requests may overlap. The delay paces submissions, so this only
+  ## decides how much of a slow source's latency is hidden.
 
 type
   FetchError* = object of CatchableError
@@ -32,7 +55,7 @@ type
     userAgent*: string
     requests*: int ## requests actually sent, cache hits excluded
     hits*: int ## answers served from the cache
-    http: HttpClient
+    http: Relay
 
   Fetch* = object
     ## One response, whether it came from the network or the cache.
@@ -41,7 +64,8 @@ type
     cached*: bool
 
 proc initClient*(cacheDir: string; delayMs = DefaultDelayMs; offline = false;
-                 userAgent = DefaultAgent): Client =
+                 userAgent = DefaultAgent;
+                 maxInFlight = DefaultMaxInFlight): Client =
   ## Creates a client.
   ##
   ## `offline` serves cached responses only and fails on a cache miss, which is
@@ -49,7 +73,8 @@ proc initClient*(cacheDir: string; delayMs = DefaultDelayMs; offline = false;
   result = Client(cacheDir: cacheDir, delayMs: delayMs, offline: offline,
                   userAgent: userAgent)
   if not offline:
-    result.http = newHttpClient(userAgent = userAgent, timeout = 30000)
+    result.http = newRelay(maxInFlight = max(1, maxInFlight),
+                           defaultTimeoutMs = 30000)
 
 proc close*(client: Client) =
   ## Releases the connection pool. Safe to call more than once.
@@ -140,17 +165,24 @@ proc waitTurn(client: Client) =
 proc requestOnce*(client: Client; url: string): Fetch {.raises: [FetchError].} =
   ## Sends one request with no cache interaction.
   ##
-  ## The `Exception` branch is deliberate: `httpclient` declares it for its TLS
-  ## and dynamic-loading paths, which are not `CatchableError`s. Defects are
-  ## matched first and re-raised, so a programming bug stays a bug rather than
-  ## being silently recorded as a source failure.
-  try:
-    let response = client.http.get(url)
-    result = Fetch(status: response.code.int, body: response.body, cached: false)
-  except Defect as error:
-    raise error
-  except Exception as error:
-    raise newException(FetchError, "GET " & url & ": " & error.msg)
+  ## Relay reports transport failures as a value rather than an exception, so
+  ## the error kind is inspected instead of caught. A `teNone` kind means the
+  ## request reached the server; the status code is the caller's business.
+  ##
+  ## Relay raises `IOError` for lifecycle misuse (a closed or busy client),
+  ## which is not a transport failure; it is folded into `FetchError` so this
+  ## proc keeps its single-exception contract.
+  var headers = emptyHttpHeaders()
+  headers["User-Agent"] = client.userAgent
+  let item = try:
+               client.http.get(url, headers = headers)
+             except IOError as error:
+               raise newException(FetchError, "GET " & url & ": " & error.msg)
+  if item.error.kind != teNone:
+    raise newException(FetchError,
+      "GET " & url & ": " & $item.error.kind & " " & item.error.message)
+  result = Fetch(status: item.response.code.int, body: item.response.body,
+                 cached: false)
 
 proc fetch*(client: Client; url: string; refresh = false): Fetch
     {.raises: [FetchError].} =

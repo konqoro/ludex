@@ -11,7 +11,7 @@ import brian
 import ludexcore/[art, models, normalize, parse, query, ratings, score, store,
                   taste]
 import ludexcore/sources/[awac, protondb]
-import ludexingest/[artcache, client, enrich]
+import ludexingest/[artcache, fetch, enrich]
 
 const Usage = """
 ludex: local-first catalogue of Linux-playable games
