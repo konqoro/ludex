@@ -30,7 +30,12 @@ proc release(appid: int; title: string): Release =
           pack: pkSingle, runtime: rkWine, appid: some(appid))
 
 proc seed(client: Client; appid: int; status: int; body: string) =
-  client.writeCacheEntry(summaryUrl(appid), status, body)
+  writeCacheEntry(client.cacheDir, summaryUrl(appid), status, body)
+
+proc fetchOne(client: Client; url: string): Fetch =
+  let swept = fetchAll(client, @[url])
+  doAssert swept.outcomes[0].answer.isSome, swept.outcomes[0].problem
+  swept.outcomes[0].answer.get
 
 block cache_file_names:
   doAssert cacheFileName("https://a/b.json") == "https___a_b.json"
@@ -41,18 +46,17 @@ block cache_file_names:
 block offline_cache_hit:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
   client.seed(1264280, 200, fixture("1264280-platinum-strong.json"))
-  let fetched = fetch(client, summaryUrl(1264280))
+  let fetched = fetchOne(client, summaryUrl(1264280))
   doAssert fetched.status == 200
   doAssert fetched.cached
   doAssert fetched.body.contains("platinum")
-  doAssert client.hits == 1
-  doAssert client.requests == 0, "offline never sends anything"
   client.close()
 
-block offline_cache_miss_raises:
+block offline_cache_miss_is_a_problem:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  doAssertRaises FetchError:
-    discard fetch(client, summaryUrl(1))
+  let swept = fetchAll(client, @[summaryUrl(1)])
+  doAssert swept.outcomes[0].answer.isNone
+  doAssert swept.outcomes[0].problem.contains("offline")
   client.close()
 
 block a_404_is_remembered_as_an_answer:
@@ -61,7 +65,7 @@ block a_404_is_remembered_as_an_answer:
   let dir = tempCacheDir()
   let client = initClient(dir, delayMs = 0, offline = true)
   client.seed(999999999, 404, "")
-  let fetched = fetch(client, summaryUrl(999999999))
+  let fetched = fetchOne(client, summaryUrl(999999999))
   doAssert fetched.status == 404
   doAssert fetched.body.len == 0
   client.close()
@@ -70,9 +74,9 @@ block corrupt_cache_entry_is_a_miss:
   let dir = tempCacheDir()
   let client = initClient(dir, delayMs = 0, offline = true)
   createDir(dir)
-  writeFile(client.cachePath(summaryUrl(7)), "this is not a cache entry")
-  doAssertRaises FetchError:
-    discard fetch(client, summaryUrl(7))
+  writeFile(cachePath(client.cacheDir, summaryUrl(7)), "this is not a cache entry")
+  let swept = fetchAll(client, @[summaryUrl(7)])
+  doAssert swept.outcomes[0].answer.isNone
   client.close()
 
 block empty_cache_dir_is_created_on_write:
@@ -80,7 +84,7 @@ block empty_cache_dir_is_created_on_write:
   removeDir(dir.parentDir)
   let client = initClient(dir, delayMs = 0, offline = true)
   client.seed(1, 200, "{}")
-  doAssert fileExists(client.cachePath(summaryUrl(1)))
+  doAssert fileExists(cachePath(client.cacheDir, summaryUrl(1)))
   client.close()
   removeDir(dir.parentDir)
 
@@ -218,7 +222,7 @@ block anticheat_is_one_request_for_everyone:
   # This source answers once for the whole catalogue, so `limit` has nothing to
   # limit and the counters describe the join rather than requests made.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(GamesUrl, 200, readFile(AwacPath))
+  writeCacheEntry(client.cacheDir, GamesUrl, 200, readFile(AwacPath))
   let releases = @[
     release(440900, "Conan Exiles Enhanced"),  # Broken upstream
     release(1237970, "Titanfall 2"),           # Supported upstream
@@ -249,7 +253,7 @@ block anticheat_merges_with_protondb_facts:
   # ProtonDB and still be blocked by its anti-cheat, and a later run of either
   # source must leave the other's facts alone.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(GamesUrl, 200, readFile(AwacPath))
+  writeCacheEntry(client.cacheDir, GamesUrl, 200, readFile(AwacPath))
   let existing = @[Enrichment(
     appid: 1237970,
     play: toPlayability(decodeSummary(fixture("1264280-platinum-strong.json")),
@@ -266,7 +270,7 @@ block anticheat_merges_with_protondb_facts:
 
 block a_failed_dataset_is_one_failure:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(GamesUrl, 404, "")
+  writeCacheEntry(client.cacheDir, GamesUrl, 404, "")
   let run = enrichAntiCheat(client, @[release(1, "One"), release(2, "Two")],
                             newSeq[Enrichment]())
   client.close()
@@ -277,7 +281,7 @@ block a_failed_dataset_is_one_failure:
 
 block dispatch_by_name:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(GamesUrl, 200, readFile(AwacPath))
+  writeCacheEntry(client.cacheDir, GamesUrl, 200, readFile(AwacPath))
   let run = enrich(client, srcAntiCheat, @[release(440900, "Conan Exiles")],
                    newSeq[Enrichment]())
   client.close()
@@ -292,22 +296,22 @@ proc spyFixture(name: string): string =
 
 block steam_needs_two_calls_per_game:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1264280, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1264280, "us"), 200,
                          steamFixture("1264280-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1264280), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1264280), 200,
                          steamFixture("1264280-reviews.json"))
-  client.writeCacheEntry(detailsUrl(1999520, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1999520, "us"), 200,
                          steamFixture("1999520-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1999520), 200,
                          steamFixture("1999520-reviews.json"))
   # `success: false` is Steam saying it has no such app, which is silence.
-  client.writeCacheEntry(detailsUrl(4403510, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(4403510, "us"), 200,
                          steamFixture("999999999-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(4403510), 404, "")
-  client.writeCacheEntry(deckUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(4403510), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(1999520), 200,
                          steamFixture("1999520-deck.json"))
-  client.writeCacheEntry(deckUrl(1264280), 404, "")
-  client.writeCacheEntry(deckUrl(4403510), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(1264280), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(4403510), 404, "")
 
   let releases = @[
     release(1264280, "Slipways"),
@@ -355,10 +359,10 @@ block steam_needs_two_calls_per_game:
 block one_steam_call_succeeding_is_worth_keeping:
   # A store entry that vanished can still have reviews, and vice versa.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(7, "us"), 404, "")
-  client.writeCacheEntry(reviewsUrl(7), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(7, "us"), 404, "")
+  writeCacheEntry(client.cacheDir, reviewsUrl(7), 200,
                          steamFixture("1264280-reviews.json"))
-  client.writeCacheEntry(deckUrl(7), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(7), 404, "")
   let run = enrichSteam(client, @[release(7, "Only Reviews")],
                         newSeq[Enrichment]())
   client.close()
@@ -370,11 +374,11 @@ block steam_facts_merge_across_sources:
   # A Steam run must not disturb playability, and a playability run must not
   # disturb the store.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1264280, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1264280, "us"), 200,
                          steamFixture("1264280-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1264280), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1264280), 200,
                          steamFixture("1264280-reviews.json"))
-  client.writeCacheEntry(deckUrl(1264280), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(1264280), 404, "")
   let existing = @[Enrichment(
     appid: 1264280,
     play: toPlayability(decodeSummary(fixture("1264280-platinum-strong.json")),
@@ -404,11 +408,11 @@ block store_facts_survive_the_store:
   # The enrichment file is the only place these facts live between runs, so the
   # codec and the merge both have to keep them.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1999520, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1999520, "us"), 200,
                          steamFixture("1999520-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1999520), 200,
                          steamFixture("1999520-reviews.json"))
-  client.writeCacheEntry(deckUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, deckUrl(1999520), 200,
                          steamFixture("1999520-deck.json"))
   let run = enrichSteam(client, @[release(1999520, "CATO")],
                         newSeq[Enrichment]())
@@ -490,10 +494,10 @@ block a_record_with_no_facts_is_rejected:
 
 block steamspy_tags_and_counts:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(spyUrl(1264280), 200, spyFixture("1264280.json"))
-  client.writeCacheEntry(spyUrl(1999520), 200, spyFixture("1999520.json"))
+  writeCacheEntry(client.cacheDir, spyUrl(1264280), 200, spyFixture("1264280.json"))
+  writeCacheEntry(client.cacheDir, spyUrl(1999520), 200, spyFixture("1999520.json"))
   # SteamSpy answers `{}` for an app it does not track.
-  client.writeCacheEntry(spyUrl(4403510), 200, "{}")
+  writeCacheEntry(client.cacheDir, spyUrl(4403510), 200, "{}")
 
   let releases = @[release(1264280, "Slipways"), release(1999520, "CATO"),
                    release(4403510, "Sensory Overload")]
@@ -523,18 +527,18 @@ block steamspy_and_steam_layer_without_overwriting:
   # The store's own fields and SteamSpy's tags come from different sources about
   # the same game, and a run of either must leave the other alone.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1264280, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1264280, "us"), 200,
                          steamFixture("1264280-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1264280), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1264280), 200,
                          steamFixture("1264280-reviews.json"))
-  client.writeCacheEntry(deckUrl(1264280), 404, "")
+  writeCacheEntry(client.cacheDir, deckUrl(1264280), 404, "")
   var existing: seq[Enrichment]
   existing = enrichSteam(client, @[release(1264280, "Slipways")], existing).items
   client.close()
   doAssert existing[0].store.genres == @["Strategy"], "the store landed"
 
   let spyClient = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  spyClient.writeCacheEntry(spyUrl(1264280), 200, spyFixture("1264280.json"))
+  writeCacheEntry(spyClient.cacheDir, spyUrl(1264280), 200, spyFixture("1264280.json"))
   let run = enrichSteamSpy(spyClient, @[release(1264280, "Slipways")], existing)
   spyClient.close()
 
@@ -548,13 +552,13 @@ block steamspy_and_steam_layer_without_overwriting:
 
 block tags_and_verdicts_survive_the_store:
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1999520, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1999520, "us"), 200,
                          steamFixture("1999520-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1999520), 200,
                          steamFixture("1999520-reviews.json"))
-  client.writeCacheEntry(deckUrl(1999520), 200,
+  writeCacheEntry(client.cacheDir, deckUrl(1999520), 200,
                          steamFixture("1999520-deck.json"))
-  client.writeCacheEntry(spyUrl(1999520), 200, spyFixture("1999520.json"))
+  writeCacheEntry(client.cacheDir, spyUrl(1999520), 200, spyFixture("1999520.json"))
   let first = enrichSteam(client, @[release(1999520, "CATO")],
                           newSeq[Enrichment]()).items
   let run = enrichSteamSpy(client, @[release(1999520, "CATO")], first)
@@ -579,9 +583,9 @@ block a_failing_call_does_not_discard_the_others:
   # envelope key does not match the app that was asked about, so a fixture
   # cannot be borrowed for an imaginary game.
   let client = initClient(tempCacheDir(), delayMs = 0, offline = true)
-  client.writeCacheEntry(detailsUrl(1264280, "us"), 200,
+  writeCacheEntry(client.cacheDir, detailsUrl(1264280, "us"), 200,
                          steamFixture("1264280-appdetails.json"))
-  client.writeCacheEntry(reviewsUrl(1264280), 200,
+  writeCacheEntry(client.cacheDir, reviewsUrl(1264280), 200,
                          steamFixture("1264280-reviews.json"))
   # deckUrl(1264280) is deliberately not cached, so that call fails.
   let run = enrichSteam(client, @[release(1264280, "Partial")],

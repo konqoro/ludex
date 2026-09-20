@@ -1,108 +1,40 @@
 ## Cached, paced, bounded HTTP: the only module in the project that opens a
 ## socket.
 ##
-## ## Three promises, three types
+## Three promises, three types. `relay`'s `maxInFlight` bounds how many sockets
+## are open; a `Pacer` bounds how often one may be used; a `Sweep` owns one batch
+## of URLs and the client's window while it runs. The client owns the cache, the
+## rate limit and the one relay handle, so it survives across batches and the CLI
+## makes exactly one per command.
 ##
-## A concurrency bound and a rate limit are not the same promise, so they are no
-## longer the same loop:
-##
-## * `relay`'s `maxInFlight` is *transport*: how many sockets may be open. It
-##   does not stop four fast answers from arriving as a burst.
-## * A `Pacer` (`ludexingest/pacer.nim`) is the *rate limit*: one submission per
-##   `delayMs`, which is what a source that publishes a request budget actually
-##   sees. It belongs to the client because it is a property of the source being
-##   asked, and it therefore survives across sweeps: two sweeps against one
-##   source cannot double that source's rate.
-## * A `Sweep` is the *batch*: it owns the pending URLs, the client's window
-##   while it runs, and the outcomes. Nothing else owns those.
-##
-## One `Client` is one source session: its cache, its rate limit, its retry
-## policy and its one `relay` handle. The CLI makes exactly one per command.
-##
-## ## The batch contract
+## The batch primitive is a stream, because relay's own queue is unbounded and
+## memory must be bounded by the window rather than by the batch:
 ##
 ## .. code-block:: nim
 ##
 ##   var sweep = initSweep(client, urls)
 ##   while true:
-##     let outcome = sweep.next()      # blocks until an answer is ready
-##     if outcome.isNone: break        # nothing is owed any more
-##     use(outcome.get)                # key, url, and an answer or a problem
+##     let outcome = sweep.next()   # blocks until an answer is ready
+##     if outcome.isNone: break     # every URL answered and the window empty
+##     use(outcome.get)             # key, url, and an answer or a problem
 ##
-## * `next` yields one outcome per URL in *completion* order, and every outcome
-##   names the request it belongs to: `key`, the URL's position in the batch, and
-##   the URL itself. Reordering into submission order would mean holding bodies
-##   in memory, which is the one thing this shape exists to avoid.
-## * An outcome is either an answer or the reason there is none, never both, and
-##   one URL's failure never discards another's answer: a batch is not
-##   all-or-nothing. A *client-level* fault (the relay worker stopped) raises
-##   `FetchError`, because that is not a fact about any one URL.
-## * `next` returns `none` exactly when every URL has been answered and the
-##   client's window is empty again. A sweep owns that window while it runs, so
-##   drive it to `none`, or `close` the client, which drains what is outstanding.
-##   A second sweep on a client whose window is still owned is refused rather
-##   than interleaved with the first.
-## * Memory is bounded by `maxInFlight` answer bodies, not by the size of the
-##   batch: a caller that writes each body out and drops it can sweep gigabytes
-##   of pictures (`ludex art` does exactly that). `fetchAll` is the deliberate
-##   exception — it holds every body and says so — and is for small JSON answers.
-## * Retries stay inside the rate limit. A URL that earns one goes to the back of
-##   the queue with a backoff and is admitted through the pacer like any other
-##   submission, so a `5xx` on one game cannot stall the sweep, and a retry
-##   cannot make the source see a burst. A `429` additionally holds *every*
-##   admission back: the source is refusing us, and retrying one URL at the same
-##   rate is not an answer to that.
+## `next` yields in completion order, so every outcome names its request (`key`
+## and `url`) instead of relying on position. An outcome is an answer or the
+## reason there is none, never both, and one URL's failure never discards
+## another's answer. `fetchAll` is the small-batch convenience that reorders into
+## submission order by holding every body; use the stream for pictures.
 ##
-## ## Waiting
+## A transient status (`429`, `5xx`) earns up to `MaxAttempts` paced retries with
+## backoff, then ends as a problem naming the status; everything else, including
+## `404`, is an answer. Answers are remembered in the cache, problems are not, and
+## a transport failure is a problem that is not retried. A client-level fault (a
+## stopped relay worker, or silence longer than twice relay's own request timeout)
+## is raised as `FetchError`, never attributed to a URL.
 ##
-## Relay waits for a result the way a socket library does: blocking, or not at
-## all. What a sweep is waiting for is whichever comes first — a finished
-## request, or the moment the rate limit admits the next submission — so it
-## waits in slices (`PollMs`), each sleep the smaller of the two. Blocking on a
-## result would be simpler than that and wrong twice over: with answers slower
-## than `delayMs` it would let the window run empty, and an empty window is
-## exactly where overlap was supposed to be doing the work. Because polling
-## never sees relay's "the worker stopped" return value, the sweep bounds
-## silence instead (`StallMs`) and reports a stopped client once, as the one
-## failure that is not about a URL.
-##
-## ## Answers, problems, and the cache
-##
-## A status the source may answer differently in a moment is *transient*: `429`
-## and `5xx`. Those earn up to `MaxAttempts` submissions with exponential
-## backoff, and if the last one is still transient the URL ends as a problem
-## naming the status. Everything else — `2xx`, `404` — is an answer. A transport
-## failure (timeout, DNS, TLS) is a problem too, and is not retried: a timeout is
-## a fact about the connection rather than about the game, and retrying a
-## 30-second timeout three times would triple the worst case of a sweep.
-##
-## Caching follows the same line: answers are remembered, problems are not. A
-## `429` or a `5xx` written to the cache is a lie the next run believes, so the
-## run that hits one is the run that retries it.
-##
-## ## Rejected shapes, and why
-##
-## * The whole batch handed to relay at once. Relay's queue is unbounded and its
-##   dispatcher is what applies `maxInFlight`, so the sweep could not notice a
-##   source refusing until that queue drained, and the pacer would race the
-##   dispatcher instead of owning the schedule.
-## * A `seq[FetchOutcome]` as the only primitive. Convenient, and right for small
-##   answers — `fetchAll` is still that — but it holds every body, which is why
-##   `ludex art` used to fetch one picture at a time and could overlap nothing.
-## * An iterator (`for outcome in client.sweep(urls)`) reads better than a
-##   cursor. `break` out of a `for` over an inline iterator skips the iterator's
-##   remaining code, and a sweep that stops early leaves results undrained in a
-##   *shared* relay instance; the state has to be an object the caller drives
-##   explicitly, or the lifecycle is a trap.
-## * A token bucket for the rate limit: see `ludexingest/pacer.nim` for the
-##   arithmetic. It buys a few seconds on a sweep that takes hours and spends
-##   margin against the source's real window budget.
-## * Counting requests on the client and reporting them as a run's cost. The
-##   counters here are cumulative session totals; a run's cost is the sweep's.
-##   Taking it from the client only looked right because the CLI makes one client
-##   per command.
+## `docs/DESIGN.md` §7.4 owns the measurements, the rejected shapes and the cost
+## of the relay dependency.
 
-import std/[deques, options, os, tables]
+import std/[deques, monotimes, options, os, tables]
 
 import relay
 
@@ -112,28 +44,20 @@ const
   DefaultAgent* = "ludex/0.1 (+https://github.com/ageralis/ludex)"
   DefaultDelayMs* = 250
   DefaultMaxInFlight* = 4
-    ## How many answers may be outstanding at once. The pacer decides how often
-    ## a request may be sent; this only decides how much of a slow source's
-    ## latency is hidden by overlapping requests it already admitted.
+    ## How many answers may be outstanding at once.
   MaxAttempts = 4
     ## Submissions a single URL gets before a transient failure is final.
   TimeoutMs = 30000
-    ## How long relay gives one request. Named here because the sweep's stall
-    ## bound is derived from it: a request relay accepted always ends in a
-    ## result within this, so silence for twice as long is not a slow source.
+    ## How long relay gives one request; `StallMs` is derived from it.
   PollMs = 50
-    ## The longest the sweep waits without looking for a finished request. It
-    ## bounds how late an answer can reach the caller; every sleep is
-    ## `min(remaining, PollMs)`, so it never makes a submission late for the
-    ## pacer.
+    ## The longest the sweep waits without looking for a finished request.
   StallMs = 2 * TimeoutMs
-    ## Silence longer than this, with submissions outstanding, is a client that
-    ## stopped rather than a source that is slow.
+    ## Silence longer than this, with submissions outstanding, is a stopped
+    ## client rather than a slow source.
 
 type
   FetchError* = object of CatchableError
-    ## Raised when a request cannot be completed, or when the client itself
-    ## fails. A per-URL failure inside a sweep is an outcome, not this.
+    ## Raised for a client-level fault, never for a per-URL failure.
 
   Client* = ref object
     ## One source session: a cache, a rate limit, a retry policy and one relay
@@ -142,23 +66,15 @@ type
     offline*: bool
       ## Serve cached answers only; a miss is a problem, never a request.
     userAgent*: string
-    requests*: int
-      ## Requests this session has sent, cache hits excluded.
-    hits*: int
-      ## Answers this session has served from the cache.
     maxInFlight*: int
-      ## The transport bound, passed to relay and used to size the window a
-      ## sweep is allowed to keep outstanding.
+      ## The transport bound relay is given and the sweep's window is sized to.
     pacer: Pacer
     http: Relay
     nextRequestId: int64
-      ## Sweep-independent: a result whose id this client never issued can only
-      ## come from a sweep that was abandoned mid-flight, and is dropped rather
-      ## than misattributed.
+      ## Sweep-independent, so a result this client never issued is dropped
+      ## rather than misattributed to a live sweep.
     sweepOpen: bool
-      ## Whether a sweep owns this client's window right now. A client's window
-      ## belongs to one sweep at a time, and this makes that a checked
-      ## precondition instead of a promise in a comment.
+      ## Whether a sweep owns this client's window right now.
 
   Fetch* = object
     ## One response, whether it came off the wire or out of the cache.
@@ -167,28 +83,21 @@ type
     cached*: bool
 
   FetchOutcome* = object
-    ## One URL's result: either an answer or the reason there is none.
-    ##
-    ## A single value rather than two parallel arrays, so "an answer or a
-    ## problem, never both" is carried by the type instead of by a convention
-    ## every caller has to remember. `key` and `url` name the request, because a
-    ## streaming sweep hands outcomes back in completion order.
+    ## One URL's result: either an answer or the reason there is none, never
+    ## both. `key` and `url` name the request, because a streaming sweep hands
+    ## outcomes back in completion order.
     key*: int
     url*: string
     answer*: Option[Fetch]
     problem*: string ## empty when `answer` is set
 
   SweepStats* = object
-    ## What one sweep cost. The client's counters are session totals; these are
-    ## the run's, which is what a summary line is talking about.
+    ## What one sweep cost, as opposed to the client's lifetime.
     requests*: int ## requests actually sent, cache hits excluded
     cached*: int ## answers served from the disk cache
     retries*: int ## admissions that were not a URL's first attempt
     cacheErrors*: int ## answers that could not be written to the cache
-    elapsedMs*: int64
-      ## Wall clock the sweep took, from `initSweep` to the moment it drained.
-      ## A sweep answered entirely from the cache is legitimately near zero, so
-      ## this is a cost, not a progress indicator.
+    elapsedMs*: int64 ## wall clock from `initSweep` to the moment it drained
 
   SweepResult* = object
     ## A finished sweep: one outcome per URL, in the order they were given.
@@ -205,9 +114,8 @@ type
   Sweep* = object
     ## One paced batch of URLs, driven by `next`.
     ##
-    ## A value object rather than a `ref`: copying it would fork the bookkeeping
-    ## of requests that are already in flight, so it is driven by `var` and left
-    ## alone. The client it borrows is the shared, long-lived part.
+    ## A value object, not a `ref`: copying it would fork the bookkeeping of
+    ## requests already in flight, so it is driven by `var` and left alone.
     client: Client
     refresh: bool
     startedMs: int64
@@ -215,19 +123,20 @@ type
     queue: Deque[Pending] ## not yet admitted, in the order they were added
     inFlight: Table[int64, Pending] ## submitted and not yet read
     ready: Deque[FetchOutcome] ## answered and not yet taken by the caller
-    lastResultMs: int64 ## when a finished request last arrived; stall bound
+    lastResultMs: int64 ## when a finished request last arrived
     stopped: bool ## the wall clock is stopped once, on the way out
     stats*: SweepStats
+
+proc monoMs(): int64 {.inline.} =
+  ## The sweep's monotonic clock, in milliseconds. It lives here because the
+  ## pacer takes the timestamp as a parameter and the sweep owns the waiting.
+  ticks(getMonoTime()) div 1_000_000
 
 proc initClient*(cacheDir: string; delayMs = DefaultDelayMs; offline = false;
                  userAgent = DefaultAgent;
                  maxInFlight = DefaultMaxInFlight): Client =
-  ## Creates one source session.
-  ##
-  ## `delayMs` is the source's request budget expressed as the floor between two
-  ## submissions; 0 means no pacing, which suits a source that answers once for
-  ## the whole dataset. `offline` never opens a socket and treats a cache miss as
-  ## a problem.
+  ## Creates one source session. `delayMs` is the source's request budget as the
+  ## floor between two submissions; 0 means no pacing.
   result = Client(cacheDir: cacheDir, offline: offline, userAgent: userAgent,
                   maxInFlight: max(1, maxInFlight),
                   pacer: Pacer(delayMs: max(0, delayMs)))
@@ -236,51 +145,26 @@ proc initClient*(cacheDir: string; delayMs = DefaultDelayMs; offline = false;
                            defaultTimeoutMs = TimeoutMs)
 
 proc close*(client: Client) =
-  ## Releases the connection pool. Safe to call more than once.
-  ##
-  ## Relay's own `close` waits for queued and in-flight work, so this is also the
-  ## way out of a sweep that was abandoned half-drained: whichever sweep owned the
-  ## client's window loses it here.
+  ## Releases the connection pool and any sweep's claim on it. Safe to call more
+  ## than once; relay's own `close` waits for queued and in-flight work.
   if client.http != nil:
     client.http.close()
     client.http = nil
   client.sweepOpen = false
 
-proc cachePath*(client: Client; url: string): string =
-  ## The cache file this session would use for `url`, so a caller can point at it
-  ## without knowing the naming rule.
-  cache.cachePath(client.cacheDir, url)
-
-proc writeCacheEntry*(client: Client; url: string; status: int; body: string)
-    {.raises: [FetchError].} =
-  ## Writes one entry into this session's cache.
-  ##
-  ## The tests seed a cache through here, which is what lets the whole pipeline
-  ## run offline.
-  try:
-    cache.writeCacheEntry(client.cacheDir, url, status, body)
-  except IOError as error:
-    raise newException(FetchError, error.msg)
-
 func isTransient(status: int): bool {.inline.} =
-  ## A status the source is asking us to come back for: `429` (too many
-  ## requests) or a `5xx` (the server is having a moment). Everything else is an
-  ## answer, including `404`, which is a fact about the game rather than a
-  ## failure of the request.
+  ## `429` and `5xx`; everything else, including `404`, is an answer.
   status == 429 or status >= 500
 
 func backoffMs(attempt: int): int {.inline.} =
-  ## One retry's wait, doubling per attempt: 500 ms after the first submission,
-  ## then 1000, then 2000.
+  ## One retry's wait, doubling per attempt: 500 ms, then 1000, then 2000.
   250 shl attempt
 
 proc initSweep*(client: Client; urls: openArray[string]; refresh = false): Sweep =
   ## Opens a sweep over `urls`, keyed by position: `urls[i]` is `key` `i`.
   ##
-  ## `refresh` ignores cache entries and fetches every URL again. A client's
-  ## window belongs to one sweep at a time — two sweeps sharing it would
-  ## interleave their requests and neither could tell whose answer arrived — so a
-  ## second sweep on a busy client is refused rather than guessed at.
+  ## A client's window belongs to one sweep at a time, so a second sweep on a
+  ## busy client is refused rather than interleaved. `refresh` ignores the cache.
   if not client.offline and client.http == nil:
     raise newException(FetchError, "client is closed")
   if client.sweepOpen:
@@ -297,51 +181,31 @@ proc initSweep*(client: Client; urls: openArray[string]; refresh = false): Sweep
   for index, url in urls:
     result.queue.addLast(Pending(url: url, key: index, attempt: 1))
 
-func pending*(sweep: Sweep): int =
-  ## How many URLs the sweep still owes an answer for; 0 means it is drained.
-  sweep.queue.len + sweep.inFlight.len
-
 proc stopClock(sweep: var Sweep) {.inline.} =
-  ## Ends the sweep: stops its wall clock and hands the client's window back.
-  ##
-  ## Every way a sweep ends comes through here — the `none` a streaming caller
-  ## sees, the last outcome `fetchAll` takes, and the one answer `fetch` takes —
-  ## so a reported duration never depends on being asked for one more answer than
-  ## there is, and a client is never left owned by a sweep nobody is driving.
+  ## Ends the sweep once: stamps its duration and releases the client's window.
   if not sweep.stopped:
     sweep.stats.elapsedMs = max(monoMs() - sweep.startedMs, 0)
     sweep.stopped = true
   sweep.client.sweepOpen = false
 
-proc answerFromCache(sweep: var Sweep; item: var Pending): bool {.raises: [].} =
-  ## Answers the head of the queue from the cache when there is an entry, and
-  ## says whether it did.
-  ##
-  ## A cache hit costs no request and is therefore not paced: a warm rerun must
-  ## not be slowed down by a rate limit that exists for sockets. On a hit the
-  ## item's URL moves into the outcome, because the queue item is dropped.
+proc answerFromCache(sweep: var Sweep; item: Pending): bool {.raises: [].} =
+  ## Answers one item from the cache when there is an entry, and says whether it
+  ## did. A cache hit costs no request, so it is not paced. A cached transient
+  ## (an old entry written before the write side refused to store one) is a miss.
   if sweep.refresh:
     return false
   let cached = cache.readCacheEntry(sweep.client.cacheDir, item.url)
-  if cached.isNone:
-    return false
-  if isTransient(cached.get.status):
-    # An older version cached a `429` or a `5xx` as if it were an answer. Reading
-    # that back would be the lie the write side refuses to write, so it is a
-    # miss: the URL is asked again, and the answer replaces the entry.
+  if cached.isNone or isTransient(cached.get.status):
     return false
   inc sweep.stats.cached
-  inc sweep.client.hits
-  sweep.ready.addLast(FetchOutcome(
-    key: item.key, url: move item.url,
+  sweep.ready.addLast(FetchOutcome(key: item.key, url: item.url,
     answer: some Fetch(status: cached.get.status, body: cached.get.body,
                        cached: true)))
   result = true
 
 proc cacheAnswer(sweep: var Sweep; url: string; fetched: Fetch) {.raises: [].} =
-  ## Remembers an answer. A cache write failure is counted, never raised: the
-  ## answer is already in hand, and losing it over a disk problem would waste the
-  ## request that earned it.
+  ## Remembers an answer. A write failure is counted, never raised: the answer is
+  ## already in hand, and losing it over a disk problem would waste the request.
   try:
     cache.writeCacheEntry(sweep.client.cacheDir, url, fetched.status,
                           fetched.body)
@@ -349,18 +213,13 @@ proc cacheAnswer(sweep: var Sweep; url: string; fetched: Fetch) {.raises: [].} =
     inc sweep.stats.cacheErrors
 
 proc submit(sweep: var Sweep; item: sink Pending) {.raises: [].} =
-  ## Hands one admitted URL to relay, or records why it could not be handed over.
-  ##
-  ## Handing it over one at a time is what keeps relay's own queue empty: the
-  ## sweep holds only what the pacer has already admitted and the window still
-  ## has room for. A relay that refuses the request (`startRequest` raises
-  ## `IOError` for a closed client) becomes this URL's problem, so it stays a
-  ## fact about the sweep rather than an exception out of it.
-  let client = sweep.client
-  let requestId = client.nextRequestId
-  inc client.nextRequestId
+  ## Hands one admitted URL to relay. A relay that refuses it (`startRequest`
+  ## raises `IOError` on a closed client) becomes this URL's problem, so it stays
+  ## a fact about the sweep rather than an exception out of it.
+  let requestId = sweep.client.nextRequestId
+  inc sweep.client.nextRequestId
   let started = try:
-                  client.http.startRequest(RequestSpec(
+                  sweep.client.http.startRequest(RequestSpec(
                     verb: hvGet, url: item.url, headers: sweep.headers,
                     requestId: requestId))
                   true
@@ -371,22 +230,18 @@ proc submit(sweep: var Sweep; item: sink Pending) {.raises: [].} =
   if started:
     sweep.inFlight[requestId] = item
     inc sweep.stats.requests
-    inc client.requests
     if item.attempt > 1:
       inc sweep.stats.retries
 
 proc take(sweep: var Sweep; item: sink RequestResult) {.raises: [].} =
-  ## Files one finished request as an answer, a retry or a problem.
-  ##
-  ## Takes the result by `sink` because it is the last thing the caller does with
-  ## it: an answer body is the biggest value in this module, and copying it here
-  ## would be for nothing.
+  ## Files one finished request as an answer, a retry or a problem. Takes the
+  ## result by `sink` because an answer body is the biggest value here and the
+  ## caller is done with it.
   sweep.lastResultMs = monoMs() # anything arriving is progress, even a refusal
   let requestId = item.response.request.requestId
   var pending: Pending
   if not sweep.inFlight.pop(requestId, pending):
-    # Unreachable: `initSweep` refuses a client that already has a sweep open, and
-    # a sweep is only ever handed results for requests it submitted itself.
+    # Unreachable: `initSweep` refuses a client that already has a sweep open.
     assert false, "result for a request this sweep does not own"
     return
   if item.error.kind != teNone:
@@ -397,42 +252,32 @@ proc take(sweep: var Sweep; item: sink RequestResult) {.raises: [].} =
   let status = item.response.code.int
   if isTransient(status):
     if status == 429:
-      # A 429 is about the address rather than about this URL, so even the last
-      # one the source gives us pushes every admission back: it is the moment the
-      # source is refusing hardest, and the wrong moment to carry on at `delayMs`.
+      # A 429 is about us, not this URL, so it pushes every admission back.
       sweep.client.pacer.hold(monoMs(), backoffMs(pending.attempt))
     if pending.attempt < MaxAttempts:
-      let waitMs = backoffMs(pending.attempt)
+      pending.dueAtMs = monoMs() + int64(backoffMs(pending.attempt))
       inc pending.attempt
-      pending.dueAtMs = monoMs() + int64(waitMs)
       sweep.queue.addLast(pending) # to the back: a retry jumps nobody's place
       return
     sweep.ready.addLast(FetchOutcome(key: pending.key, url: pending.url,
       problem: "GET " & pending.url & ": HTTP " & $status & " after " &
                $MaxAttempts & " attempts"))
     return
-  var fetched = Fetch(status: status, body: item.response.body, cached: false)
+  let fetched = Fetch(status: status, body: item.response.body, cached: false)
   sweep.cacheAnswer(pending.url, fetched)
   sweep.ready.addLast(FetchOutcome(key: pending.key, url: pending.url,
                                    answer: some fetched))
 
 proc waitForFinished(sweep: var Sweep; dueMs: int64;
                      item: var RequestResult): bool {.raises: [FetchError].} =
-  ## Waits a slice for one finished request, and says whether one arrived.
+  ## Waits a slice for one finished request, the slice being the smaller of the
+  ## time until the pacer admits the next submission and `PollMs`. Blocking
+  ## outright would starve the pacer and let the window run empty exactly when
+  ## answers are slower than `delayMs`.
   ##
-  ## Relay has no wait-with-timeout: it offers a blocking wait and a poll. The
-  ## sweep waits in slices instead, and the slice is the smaller of the time
-  ## until the rate limit admits the next submission and `PollMs` — so an answer
-  ## reaches the caller promptly, and a submission lands on the pacer's deadline
-  ## rather than after it. Blocking outright would be simpler and wrong: with
-  ## answers slower than `delayMs` it lets the window run empty, and that is
-  ## exactly the case where overlapping is the only throughput there is.
-  ##
-  ## The price of polling is that relay's "the worker stopped" return value is
-  ## never seen, so silence is bounded here instead: every request relay accepts
-  ## ends in a result within its own timeout, so a much longer silence with
-  ## submissions outstanding is a stopped client, reported once for the whole
-  ## sweep rather than once per URL.
+  ## Polling never sees relay's "the worker stopped" return value, so silence is
+  ## bounded here instead: every accepted request ends within relay's timeout, so
+  ## a much longer silence with submissions outstanding is a stopped client.
   let slice = if dueMs > 0: min(dueMs, int64(PollMs)) else: int64(PollMs)
   sleep(max(slice, 1).int)
   result = sweep.client.http.pollForResult(item)
@@ -442,28 +287,19 @@ proc waitForFinished(sweep: var Sweep; dueMs: int64;
                        " seconds with requests outstanding")
 
 proc step(sweep: var Sweep) {.raises: [FetchError].} =
-  ## One transition of the sweep, in priority order:
-  ##
-  ## 1. File a finished request that is already waiting, before spending another
-  ##    submission: a refusal the source has already sent has to hold the next
-  ##    admission back, not be discovered after it.
-  ## 2. Answer the head of the queue from the cache, which costs no request and is
-  ##    therefore not paced.
-  ## 3. Submit it, when the rate limit and the window both allow.
-  ## 4. Wait for an answer, in the way that does not starve the pacer
-  ##    (`waitForFinished`).
-  ## 5. With nothing on the wire, sleep out the rate limit, because that is the
-  ##    only thing left to wait for.
+  ## One transition of the sweep: file a finished request, then answer or submit
+  ## the queue head, then wait out whatever is left.
   if sweep.inFlight.len > 0:
     var waiting: RequestResult
     if sweep.client.http.pollForResult(waiting):
       sweep.take(waiting)
       return
+
   let now = monoMs()
   var dueMs: int64 = 0
   if sweep.queue.len > 0:
-    dueMs = sweep.client.pacer.dueInMs(now)
-    dueMs = max(dueMs, sweep.queue.peekFirst.dueAtMs - now)
+    dueMs = max(sweep.client.pacer.dueInMs(now),
+                sweep.queue.peekFirst.dueAtMs - now)
     var item = sweep.queue.popFirst()
     if sweep.answerFromCache(item):
       return
@@ -476,6 +312,7 @@ proc step(sweep: var Sweep) {.raises: [FetchError].} =
       sweep.submit(item)
       return
     sweep.queue.addFirst(item) # not yet: it keeps its place at the head
+
   if sweep.inFlight.len > 0:
     var finished: RequestResult
     if sweep.waitForFinished(dueMs, finished):
@@ -484,13 +321,11 @@ proc step(sweep: var Sweep) {.raises: [FetchError].} =
     sleep(dueMs.int)
 
 proc next*(sweep: var Sweep): Option[FetchOutcome] {.raises: [FetchError].} =
-  ## The next answer, blocking until one is ready.
-  ##
-  ## `none` means the sweep is drained: every URL has been answered and the
-  ## client's window is empty. That is the only exit a caller needs.
+  ## The next answer, blocking until one is ready. `none` means the sweep is
+  ## drained: every URL has been answered and the window is empty.
   if not sweep.client.offline and sweep.client.http == nil:
     raise newException(FetchError, "client is closed")
-  while sweep.ready.len == 0 and pending(sweep) > 0:
+  while sweep.ready.len == 0 and sweep.queue.len + sweep.inFlight.len > 0:
     sweep.step()
   if sweep.ready.len > 0:
     result = some sweep.ready.popFirst()
@@ -501,34 +336,13 @@ proc fetchAll*(client: Client; urls: openArray[string]; refresh = false):
     SweepResult {.raises: [FetchError].} =
   ## Fetches every URL and returns one outcome per URL, in the order given.
   ##
-  ## This holds every body in memory at once, which makes it the right call for a
-  ## few thousand JSON answers and the wrong one for pictures; `initSweep` and
-  ## `next` are the streaming form. Memory is bounded by the batch here, on
-  ## purpose and in the open.
+  ## This holds every body in memory at once; `initSweep` and `next` are the
+  ## streaming form for pictures.
   var sweep = initSweep(client, urls, refresh)
   result.outcomes = newSeq[FetchOutcome](urls.len)
-  var answered = 0
-  while answered < urls.len:
+  while true:
     let outcome = sweep.next()
     if outcome.isNone:
       break
-    var item = outcome.get
-    result.outcomes[item.key] = item
-    inc answered
-  assert answered == urls.len, "a drained sweep answers every URL it was given"
-  sweep.stopClock()
+    result.outcomes[outcome.get.key] = outcome.get
   result.stats = sweep.stats
-
-proc fetch*(client: Client; url: string; refresh = false): Fetch
-    {.raises: [FetchError].} =
-  ## The single-URL case of a sweep, and the one place a missing answer raises:
-  ## a caller that asked for exactly one thing has no per-URL result to inspect.
-  ## A `404` is still an answer, not a failure.
-  var sweep = initSweep(client, [url], refresh)
-  let outcome = sweep.next()
-  sweep.stopClock() # one URL: answered or not, the sweep is over
-  if outcome.isNone:
-    raise newException(FetchError, "no answer for " & url)
-  if outcome.get.answer.isNone:
-    raise newException(FetchError, outcome.get.problem)
-  result = outcome.get.answer.get

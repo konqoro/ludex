@@ -43,7 +43,6 @@ block a_cached_response_is_an_answer_that_names_its_request:
   doAssert outcome.problem.len == 0, "an answer and a problem are exclusive"
   doAssert swept.stats.cached == 1
   doAssert swept.stats.requests == 0, "a cache hit sends nothing"
-  doAssert client.hits == 1
 
 block a_miss_offline_is_a_problem_and_not_a_request:
   let dir = tempCache("miss")
@@ -57,7 +56,6 @@ block a_miss_offline_is_a_problem_and_not_a_request:
   doAssert outcome.problem.contains(Missing), "and which URL it happened to"
   doAssert swept.stats.requests == 0, "offline never sends anything"
   doAssert swept.stats.cached == 0
-  doAssert client.requests == 0, "the session count agrees"
 
 block one_outcome_per_url_in_the_order_given:
   # The batch boundary's promise: outcomes line up with the URLs, so a caller
@@ -106,7 +104,6 @@ block a_sweep_hands_back_every_url_once_and_then_says_it_is_done:
       break
     keys.add outcome.get.key
     urlsSeen.add outcome.get.url
-    doAssert sweep.pending >= 0
   client.close()
 
   keys.sort()
@@ -115,7 +112,6 @@ block a_sweep_hands_back_every_url_once_and_then_says_it_is_done:
   var sortedUrls = @[SeedOne, Missing, SeedTwo]
   sortedUrls.sort()
   doAssert urlsSeen == sortedUrls
-  doAssert sweep.pending == 0, "a drained sweep owes nothing"
   doAssert sweep.next().isNone, "and it stays drained when asked again"
   doAssert sweep.stats.elapsedMs >= 0
 
@@ -123,7 +119,6 @@ block an_empty_sweep_is_done_immediately:
   let dir = tempCache("empty")
   let client = initClient(dir, delayMs = 0, offline = true)
   var sweep = initSweep(client, newSeq[string]())
-  doAssert sweep.pending == 0
   doAssert sweep.next().isNone
   client.close()
 
@@ -183,7 +178,6 @@ block a_client_is_owned_by_one_sweep_at_a_time:
   let client = initClient(dir, delayMs = 0, offline = true)
   writeCacheEntry(dir, SeedOne, 200, "one")
   var open = initSweep(client, @[SeedOne, SeedTwo])
-  doAssert open.pending == 2, "nothing has been asked for yet"
   doAssertRaises FetchError:
     discard initSweep(client, @[SeedTwo])
   while open.next().isSome:
@@ -200,15 +194,15 @@ block a_drained_sweep_hands_the_client_back:
   doAssert second.outcomes[0].answer.isSome, "the next sweep is welcome"
   client.close()
 
-block fetch_is_the_single_url_case:
+block a_single_url_is_a_sweep_of_one:
   let dir = tempCache("single")
   let client = initClient(dir, delayMs = 0, offline = true)
   writeCacheEntry(dir, SeedOne, 200, "one")
-  let fetched = fetch(client, SeedOne)
-  doAssert fetched.status == 200
-  doAssert fetched.cached
-  doAssertRaises FetchError:
-    discard fetch(client, Missing)
+  let hit = fetchAll(client, @[SeedOne])
+  doAssert hit.outcomes[0].answer.get.status == 200
+  doAssert hit.outcomes[0].answer.get.cached
+  let miss = fetchAll(client, @[Missing])
+  doAssert miss.outcomes[0].answer.isNone
   client.close()
 
 echo "tfetch: ok"

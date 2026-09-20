@@ -29,11 +29,10 @@
 ## generous, and every admission, not just the one that was refused, is pushed
 ## back.
 
-import std/monotimes
-
 type
   Pacer* = object
-    ## The rate limit for one source. Times are `monoMs` values.
+    ## The rate limit for one source. Times are millisecond values taken from a
+    ## monotonic clock.
     delayMs*: int
       ## The floor between two submissions; 0 means no pacing at all, which is
       ## what a source that answers once for the whole dataset wants.
@@ -45,18 +44,6 @@ type
       ## When the last submission was admitted.
     holdUntilMs: int64
       ## A cooldown the source itself asked for; no admission before this.
-
-proc monoMs*(): int64 =
-  ## The monotonic clock in milliseconds.
-  ##
-  ## A `proc` rather than a `func`, because reading a clock is not pure — which
-  ## is exactly why the pacer takes the timestamp as a parameter instead of
-  ## calling this itself. Monotonic on purpose: a rate limit measured against the
-  ## wall clock can jump backwards under NTP and admit a burst it has already
-  ## spent. `MonoTime` always carries nanosecond ticks, whatever the platform's
-  ## clock granularity is, so dividing is exact enough for a delay measured in
-  ## milliseconds.
-  ticks(getMonoTime()) div 1_000_000
 
 func dueInMs*(pacer: Pacer; nowMs: int64): int64 =
   ## Milliseconds still to wait before the next submission is due; 0 means now.

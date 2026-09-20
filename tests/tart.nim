@@ -8,7 +8,7 @@
 import std/[options, os, strutils]
 
 import ludexcore/[art, models]
-import ludexingest/[artcache, fetch]
+import ludexingest/[artcache, cache, fetch]
 
 const
   HeaderUrl = "https://example.test/store/header.jpg"
@@ -58,9 +58,9 @@ block the_wide_page_art_lands_beside_the_header:
   # from the header rather than a replacement for it, so both are written.
   let root = tempDir("background")
   let client = initClient(tempDir("cachebg"), delayMs = 0, offline = true)
-  client.writeCacheEntry(BackgroundUrl, 200, "BACKGROUND-BYTES")
-  client.writeCacheEntry(HeaderUrl, 200, "HEADER-BYTES")
-  client.writeCacheEntry(ShotUrl, 200, "SHOT-BYTES")
+  writeCacheEntry(client.cacheDir, BackgroundUrl, 200, "BACKGROUND-BYTES")
+  writeCacheEntry(client.cacheDir, HeaderUrl, 200, "HEADER-BYTES")
+  writeCacheEntry(client.cacheDir, ShotUrl, 200, "SHOT-BYTES")
   let items = @[enrichment(ArtFacts(
     background: some initFact(BackgroundUrl, srcSteam, 1),
     header: some initFact(HeaderUrl, srcSteam, 1),
@@ -81,8 +81,8 @@ block the_wide_page_art_lands_beside_the_header:
 block downloads_the_header_and_every_screenshot:
   let root = tempDir("download")
   let client = initClient(tempDir("cache"), delayMs = 0, offline = true)
-  client.writeCacheEntry(HeaderUrl, 200, "HEADER-BYTES")
-  client.writeCacheEntry(ShotUrl, 200, "SHOT-BYTES")
+  writeCacheEntry(client.cacheDir, HeaderUrl, 200, "HEADER-BYTES")
+  writeCacheEntry(client.cacheDir, ShotUrl, 200, "SHOT-BYTES")
   let stats = fetchArt(client, @[enrichment(twoImages())], root)
   client.close()
 
@@ -100,8 +100,8 @@ block a_second_run_downloads_nothing:
   # This is what makes `--limit` a resumable cursor instead of a re-download.
   let root = tempDir("resume")
   let client = initClient(tempDir("cache2"), delayMs = 0, offline = true)
-  client.writeCacheEntry(HeaderUrl, 200, "HEADER-BYTES")
-  client.writeCacheEntry(ShotUrl, 200, "SHOT-BYTES")
+  writeCacheEntry(client.cacheDir, HeaderUrl, 200, "HEADER-BYTES")
+  writeCacheEntry(client.cacheDir, ShotUrl, 200, "SHOT-BYTES")
   discard fetchArt(client, @[enrichment(twoImages())], root)
   let again = fetchArt(client, @[enrichment(twoImages())], root)
   client.close()
@@ -115,7 +115,7 @@ block a_image_that_will_not_come_is_reported_not_raised:
   let root = tempDir("missing")
   let client = initClient(tempDir("cache3"), delayMs = 0, offline = true)
   # Nothing cached for this one, so an offline fetch fails.
-  client.writeCacheEntry(HeaderUrl, 403, "denied")
+  writeCacheEntry(client.cacheDir, HeaderUrl, 403, "denied")
   let items = @[enrichment(ArtFacts(
     header: some initFact(MissingUrl, srcSteam, 1),
     screenshots: some initFact(@[Screenshot(thumbnail: HeaderUrl)], srcSteam, 1)))]
@@ -139,8 +139,8 @@ block a_game_with_no_pictures_is_not_visited:
     enrichment(twoImages(), appid = 2),
     enrichment(twoImages(), appid = 3),
   ]
-  client.writeCacheEntry(HeaderUrl, 200, "H")
-  client.writeCacheEntry(ShotUrl, 200, "S")
+  writeCacheEntry(client.cacheDir, HeaderUrl, 200, "H")
+  writeCacheEntry(client.cacheDir, ShotUrl, 200, "S")
   let stats = fetchArt(client, items, root, limit = 1)
   client.close()
   doAssert stats.games == 1, "limit counts games, not images"
