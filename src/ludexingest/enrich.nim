@@ -2,8 +2,9 @@
 ##
 ## The pipeline is the same for every source: pick the app ids worth asking
 ## about, fetch, decode with a pure decoder, merge into what is already known,
-## and keep going when one game fails. This module is the batch boundary, so a
-## per-game failure is recorded instead of ending the run.
+## and keep going when one game fails. The fetching itself is `fetch.nim`'s
+## batch primitive; what this module adds is the accounting, so a per-game
+## failure is recorded instead of ending the run.
 ##
 ## The merge rule is deliberately simple: a freshly fetched fact replaces the
 ## previous one, and everything else is left alone. That is what makes
@@ -30,6 +31,10 @@ type
     answered*: int ## app ids the source had data for
     silent*: int ## app ids the source answered "nothing known" for
     cached*: int ## answers served from the cache
+    requests*: int ## HTTP requests this run sent, cache hits excluded
+    retries*: int ## submissions that were not a URL's first attempt
+    cacheErrors*: int ## answers that could not be written to the cache
+    elapsedMs*: int64 ## wall clock the fetching took
     failed*: int ## app ids nothing could be fetched for at all
     partial*: int ## app ids where some calls failed and others answered
     failures*: seq[string] ## `<appid>: <reason>`
@@ -132,6 +137,18 @@ proc collect(known: Table[int, Enrichment]): seq[Enrichment] =
     result.add item
   result.sort(proc (a, b: Enrichment): int = cmp(a.appid, b.appid))
 
+proc recordBatch(stats: var RunStats; swept: SweepStats) =
+  ## Copies one batch's cost into the run's report.
+  ##
+  ## The client's own counters are session totals: they were only ever the right
+  ## number to print because the CLI makes one client per command. A run's cost
+  ## is the run's, and a batch is a run.
+  stats.cached = swept.cached
+  stats.requests = swept.requests
+  stats.retries = swept.retries
+  stats.cacheErrors = swept.cacheErrors
+  stats.elapsedMs = swept.elapsedMs
+
 proc steamFacts(answers: openArray[FetchOutcome]; base: int; appid: int;
                 problems: var seq[string]): SteamFacts =
   ## Turns one game's three pre-fetched answers into facts.
@@ -190,7 +207,8 @@ proc enrichSteam*(client: Client; releases: openArray[Release];
     urls[i * 3] = detailsUrl(appid, country)
     urls[i * 3 + 1] = reviewsUrl(appid)
     urls[i * 3 + 2] = deckUrl(appid)
-  let answers = fetchAll(client, urls, refresh)
+  let swept = fetchAll(client, urls, refresh)
+  let answers = swept.outcomes
 
   for i, appid in asked:
     var gameProblems: seq[string] = @[]
@@ -213,7 +231,7 @@ proc enrichSteam*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.cached = client.hits
+  result.stats.recordBatch(swept.stats)
   result.items = collect(known)
 
 proc enrichSteamSpy*(client: Client; releases: openArray[Release];
@@ -236,7 +254,8 @@ proc enrichSteamSpy*(client: Client; releases: openArray[Release];
   var urls = newSeq[string](asked.len)
   for i, appid in asked:
     urls[i] = spyUrl(appid)
-  let answers = fetchAll(client, urls, refresh)
+  let swept = fetchAll(client, urls, refresh)
+  let answers = swept.outcomes
 
   for i, appid in asked:
     var facts = SteamFacts()
@@ -258,7 +277,7 @@ proc enrichSteamSpy*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.cached = client.hits
+  result.stats.recordBatch(swept.stats)
   result.items = collect(known)
 
 proc applyFacts(known: var Table[int, Enrichment]; updates: openArray[Release];
@@ -285,17 +304,24 @@ proc enrichAntiCheat*(client: Client; releases: openArray[Release];
   ##
   ## This source answers once for everyone, so `limit` does not apply to it and
   ## is ignored. One request, 1167 games, and a per-entry decode that cannot
-  ## fail the whole run.
+  ## fail the whole run. A dataset that could not be fetched at all is one
+  ## failure — the whole source is one row — and never an exception: a run that
+  ## cannot reach one address must still report what it did.
   var known = indexByAppId(existing)
-  let fetched = fetch(client, GamesUrl, refresh)
-  if fetched.status == 200:
+  let swept = fetchAll(client, [GamesUrl], refresh)
+  let answer = swept.outcomes[0]
+  if answer.answer.isSome and answer.answer.get.status == 200:
     result.stats = applyFacts(known, releases,
-                              indexByAppId(decodeDataset(fetched.body), nowUnix()))
+      indexByAppId(decodeDataset(answer.answer.get.body), nowUnix()))
   else:
     result.stats.asked = appIdsOf(releases).len
     result.stats.failed = 1
-    result.stats.failures.add("dataset: HTTP " & $fetched.status)
-  result.stats.cached = client.hits
+    result.stats.failures.add "dataset: " & (if answer.problem.len > 0:
+                                               answer.problem
+                                             else:
+                                               "HTTP " &
+                                               $answer.answer.get.status)
+  result.stats.recordBatch(swept.stats)
   result.items = collect(known)
 
 proc enrichSummary*(client: Client; releases: openArray[Release];
@@ -319,7 +345,8 @@ proc enrichSummary*(client: Client; releases: openArray[Release];
   var urls = newSeq[string](asked.len)
   for i, appid in asked:
     urls[i] = summaryUrl(appid)
-  let answers = fetchAll(client, urls, refresh)
+  let swept = fetchAll(client, urls, refresh)
+  let answers = swept.outcomes
 
   for i, appid in asked:
     var update = none(Playability)
@@ -344,7 +371,7 @@ proc enrichSummary*(client: Client; releases: openArray[Release];
     else:
       inc result.stats.silent
 
-  result.stats.cached = client.hits
+  result.stats.recordBatch(swept.stats)
   result.items = collect(known)
 
 proc enrich*(client: Client; source: SourceKind; releases: openArray[Release];

@@ -62,7 +62,7 @@ Options for `art` (downloads the store's pictures):
   --enrichment <file>                      default data/enrichment.jsonl
   --art <dir>                              where the images go, default data/art
   --cache <dir>                            response cache, default data/cache
-  --delay <ms>                             pause between images, default 100
+  --delay <ms>                             minimum gap between requests, 100
   --limit <n>                              stop after n games, default all
   --refresh                                fetch again despite a local file
   --offline                                never touch the network
@@ -71,7 +71,7 @@ Options for `enrich`:
   --source protondb|anticheat|steam|steamspy   which source to ask
   --cc <country>                           price country for steam, default us
   --cache <dir>                            response cache, default data/cache
-  --delay <ms>                             override the per-source pause
+  --delay <ms>                             override the per-source minimum gap
   --limit <n>                              stop after n app ids, default all
   --refresh                                ignore cached responses
   --offline                                never touch the network
@@ -291,6 +291,25 @@ proc formatSize(bytes: int64): string =
 
 proc formatSize(release: Release): string =
   if release.sizeBytes.isSome: formatSize(release.sizeBytes.get) else: "-"
+
+proc formatDuration(ms: int64): string =
+  ## Wall clock the way a sweep is read: seconds while it is short, then minutes,
+  ## because a Steam sweep is measured in hours and "8160s" is not a duration
+  ## anyone reads.
+  let total = (ms + 500) div 1000
+  if total < 60:
+    result = $total & "s"
+  elif total < 3600:
+    result = $(total div 60) & "m " & $(total mod 60) & "s"
+  else:
+    result = $(total div 3600) & "h " & $((total mod 3600) div 60) & "m"
+
+proc reportPoliteness(retries, cacheErrors: int) =
+  ## Says the two things the counters cannot show on their own: how often a
+  ## source pushed back, and how many answers exist only in memory because the
+  ## cache refused them.
+  if retries > 0 or cacheErrors > 0:
+    echo retries, " retried, ", cacheErrors, " could not be cached"
 
 proc formatRuntime(runtime: RuntimeKind): string =
   if runtime == rkUnknown: "-" else: $runtime
@@ -578,6 +597,8 @@ proc commandEnrich(request: Request) =
   echo run.stats.asked, " asked, ", run.stats.answered, " answered, ",
     run.stats.silent, " silent, ", run.stats.cached, " from cache, ",
     run.stats.partial, " partial, ", run.stats.failed, " failed"
+  echo run.stats.requests, " requests in ", formatDuration(run.stats.elapsedMs)
+  reportPoliteness(run.stats.retries, run.stats.cacheErrors)
   for failure in run.stats.failures:
     stderr.writeLine("ludex: " & failure)
   echo "wrote ", outPath
@@ -611,8 +632,11 @@ proc commandArt(request: Request) =
   finally:
     client.close()
 
-  echo stats.games, " games, ", stats.fetched, " images fetched, ",
-    stats.skipped, " already here, ", stats.failed, " failed"
+  echo stats.games, " games, ", stats.fetched, " images written, ",
+    stats.cached, " from cache, ", stats.skipped, " already here, ",
+    stats.failed, " failed"
+  echo stats.requests, " requests in ", formatDuration(stats.elapsedMs)
+  reportPoliteness(stats.retries, stats.cacheErrors)
   for failure in stats.failures:
     stderr.writeLine("ludex: " & failure)
   echo "wrote ", artRoot

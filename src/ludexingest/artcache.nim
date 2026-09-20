@@ -1,18 +1,26 @@
 ## Downloading the store's pictures into the local art cache.
 ##
 ## The cache *layout* is `ludexcore/art.nim`, which is pure; this is the
-## downloader that fills it, named after the cache it fills so the two modules
-## do not share a name.
+## downloader that fills it, named after the cache it fills so the two modules do
+## not share a name.
 ##
 ## Why this is a CLI job and not a window job: a picture is 50-200 KB and a
 ## catalogue sweep is thousands of them, so the window would lose its "works
 ## offline" property the moment it rendered a list. Instead the CLI fetches,
 ## caches and writes files, and the window only ever opens a local path.
 ##
-## It behaves like every other fetch in this project: through the same caching,
-## rate-limited `Client`, one picture at a time, already-present files skipped,
-## and a failure recorded against the game rather than aborting the run. Re-running
-## is therefore free and safe, which is what makes `--limit` a resumable cursor.
+## Why one sweep and not one picture at a time: `fetch.nim`'s batch primitive
+## streams, so this walks the store once to plan — the URLs and file names are
+## cheap strings — and then writes each body as it arrives and drops it. Memory
+## is bounded by the client's window instead of by the size of the catalogue,
+## which is what turns "download a few thousand pictures" from a gigabyte of
+## bodies into a bounded operation. The same client, cache and rate limit as
+## every other fetch, so re-running is free and safe: already-present files are
+## skipped while planning, and `--limit` stays a resumable cursor.
+##
+## A failure is recorded against the game rather than aborting the run. A refused
+## status is a failure here, unlike a store `404`: a missing picture is missing
+## art, while a missing Steam store entry is an answer about the game.
 ##
 ## The pictures are the only thing downloaded outside `data/cache` proper: the
 ## cache holds the raw responses, the art directory holds the decoded files the
@@ -22,21 +30,32 @@ import std/[options, os]
 
 import ludexcore/[art, models]
 
-import fetch
+import ./fetch
 
 const
   DefaultArtDelayMs* = 100
-    ## The CDN is not the store API, so the 1600 ms store pause would only make
-    ## a sweep slow. Still a pause, because a sweep is a burst by nature.
+    ## The CDN is not the store API, so the store's 1600 ms floor would only make
+    ## a sweep slow. Still a floor, because a sweep is a burst by nature.
 
 type
   ArtStats* = object
     ## What one sweep did, in the same spirit as `RunStats`.
     games*: int ## games that had a picture to fetch
     fetched*: int ## images written this run
+    cached*: int ## pictures answered from the cache rather than the network
     skipped*: int ## images already on disk
     failed*: int
-    failures*: seq[string] ## `<appid>: <reason>`, kept per image
+    failures*: seq[string] ## `<appid>: <file>: <reason>`, kept per image
+    requests*: int ## pictures asked for over the network, cache hits excluded
+    retries*: int ## pictures that were not fetched on the first attempt
+    cacheErrors*: int ## responses that could not be written to the cache
+    elapsedMs*: int64
+
+  Target = object
+    ## One picture the sweep owes: where it goes, and which game it belongs to.
+    appid: int
+    path: string
+    name: string
 
 func wantedImages(store: SteamFacts): seq[(string, string)] =
   ## The (url, file name) pairs one game needs, widest first: the background is
@@ -56,13 +75,24 @@ func wantedImages(store: SteamFacts): seq[(string, string)] =
       if url.len > 0:
         result.add (url, screenshotFileName(index + 1, url))
 
+func failureReason(outcome: FetchOutcome): string =
+  ## Why one picture is not on disk: an answer with a status that is not a
+  ## picture, or the reason the request never got one.
+  if outcome.answer.isSome:
+    "HTTP " & $outcome.answer.get.status
+  else:
+    outcome.problem
+
 proc fetchArt*(client: Client; items: openArray[Enrichment]; root: string;
                limit = 0; refresh = false): ArtStats =
   ## Downloads the pictures of every enriched game that names any, into
   ## `<root>/<appid>/`.
   ##
   ## `limit` caps how many games are visited, not how many images, so a sweep can
-  ## be stopped and resumed without re-counting its own output.
+  ## be stopped and resumed without re-counting its own output. A game with no
+  ## pictures is not visited and does not count against the limit.
+  var urls: seq[string] = @[]
+  var targets: seq[Target] = @[]
   var visited = 0
   for item in items:
     if limit > 0 and visited >= limit:
@@ -78,19 +108,32 @@ proc fetchArt*(client: Client; items: openArray[Enrichment]; root: string;
       if fileExists(path) and not refresh:
         inc result.skipped
       else:
-        var failure = ""
-        try:
-          let response = client.fetch(url, refresh = refresh)
-          if response.status notin 200..299:
-            failure = "HTTP " & $response.status
-          else:
-            createDir(dir)
-            writeFile(path, response.body)
-            inc result.fetched
-        except FetchError as error:
-          failure = error.msg
-        except CatchableError as error:
-          failure = "cannot write " & path & ": " & error.msg
-        if failure.len > 0:
-          inc result.failed
-          result.failures.add $item.appid & ": " & name & ": " & failure
+        urls.add url # the sweep key is this URL's position in `urls`
+        targets.add Target(appid: item.appid, path: path, name: name)
+
+  var sweep = initSweep(client, urls, refresh)
+  while true:
+    let outcome = sweep.next()
+    if outcome.isNone:
+      break
+    let picture = outcome.get
+    let target = targets[picture.key]
+    if picture.answer.isSome and picture.answer.get.status in 200..299:
+      try:
+        createDir(target.path.parentDir)
+        writeFile(target.path, picture.answer.get.body)
+        inc result.fetched
+      except CatchableError as error:
+        inc result.failed
+        result.failures.add $target.appid & ": " & target.name &
+          ": cannot write " & target.path & ": " & error.msg
+    else:
+      inc result.failed
+      result.failures.add $target.appid & ": " & target.name & ": " &
+        failureReason(picture)
+
+  result.requests = sweep.stats.requests
+  result.cached = sweep.stats.cached
+  result.retries = sweep.stats.retries
+  result.cacheErrors = sweep.stats.cacheErrors
+  result.elapsedMs = sweep.stats.elapsedMs
