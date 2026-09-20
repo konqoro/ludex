@@ -10,6 +10,7 @@
 ## carries the extra FFI bindings or the timer.
 
 when defined(ludexSnapshot):
+  import std/[os, strutils]
   import owlkettle
   import owlkettle/bindings/gtk
 
@@ -36,17 +37,26 @@ when defined(ludexSnapshot):
                                   clear: cbool) {.importc, cdecl.}
   proc gtk_widget_get_next_sibling(widget: GtkWidget): GtkWidget {.importc, cdecl.}
 
+  proc gtk_widget_get_mapped(widget: GtkWidget): cbool {.importc, cdecl.}
+  proc gtk_adjustment_get_upper(adjustment: GtkAdjustment): cdouble {.importc, cdecl.}
+  proc gtk_adjustment_get_page_size(adjustment: GtkAdjustment): cdouble {.importc, cdecl.}
+
   const GtkStateFlagPrelight = 2.cuint
     ## `GTK_STATE_FLAG_PRELIGHT`, the state a pointer hover puts a widget in.
 
-  proc firstToplevel(): GtkWidget =
-    let toplevels = gtk_window_get_toplevels()
-    if toplevels.isNil:
-      return GtkWidget(nil)
-    let item = g_list_model_get_item(toplevels, 0)
-    if item.isNil:
-      return GtkWidget(nil)
-    result = GtkWidget(item)
+  proc toplevel(last = false): GtkWidget =
+    ## Returns an owned reference. Dialogs are appended after the main window.
+    let windows = gtk_window_get_toplevels()
+    for index in 0..<int(g_list_model_get_n_items(windows)):
+      let window = GtkWidget(g_list_model_get_item(windows, cuint(index)))
+      if bool(gtk_widget_get_mapped(window)):
+        if not result.isNil:
+          g_object_unref(cast[pointer](result))
+        result = window
+        if not last:
+          return
+      else:
+        g_object_unref(cast[pointer](window))
 
   proc findByCssName(widget: GtkWidget; name: string): GtkWidget =
     var child = gtk_widget_get_first_child(widget)
@@ -81,7 +91,7 @@ when defined(ludexSnapshot):
     ## Development only: puts the first `FlowBox` child into the hover state, so
     ## a capture shows exactly what the pointer would. There is no way to move a
     ## pointer from here, and hover styling is otherwise invisible to review.
-    let window = firstToplevel()
+    let window = toplevel()
     if window.isNil:
       return false
     defer: g_object_unref(cast[pointer](window))
@@ -103,7 +113,7 @@ when defined(ludexSnapshot):
     ## it. The window has more than one, so the caller names which, and the
     ## popover is taken from that button: the window's first `popover` is not
     ## necessarily the one that was opened.
-    let window = firstToplevel()
+    let window = toplevel()
     if window.isNil:
       return false
     defer: g_object_unref(cast[pointer](window))
@@ -135,11 +145,10 @@ when defined(ludexSnapshot):
       cdouble(width), cdouble(height))
     let node = gtk_snapshot_free_to_node(snapshot)
     if node.isNil:
+      gtk_widget_queue_draw(target)
       return false
     defer: gsk_render_node_unref(node)
-    var renderer = gtk_native_get_renderer(target)
-    if renderer.isNil:
-      renderer = gtk_native_get_renderer(firstToplevel())
+    let renderer = gtk_native_get_renderer(gtk_widget_get_native(target))
     if renderer.isNil:
       return false
     let texture = gsk_renderer_render_texture(renderer, node, nil)
@@ -149,23 +158,24 @@ when defined(ludexSnapshot):
     result = bool(gdk_texture_save_to_png(texture, path.cstring))
 
   proc capture(path: string): bool =
-    ## Renders the first toplevel to `path`.
-    let window = firstToplevel()
+    ## Renders the active dialog, or the main window, to `path`.
+    let window = toplevel(last = true)
     if window.isNil:
       return false
     defer: g_object_unref(cast[pointer](window))
     result = captureWidget(window, path)
 
-  proc capturePopover(path: string): bool =
-    ## Renders the open popover, which is not part of the window's own surface.
-    let window = firstToplevel()
+  proc scrollContent(fraction: float) =
+    let window = toplevel(last = true)
     if window.isNil:
-      return false
+      return
     defer: g_object_unref(cast[pointer](window))
-    let popover = findByCssName(window, "popover")
-    if popover.isNil:
-      return false
-    result = captureWidget(popover, path)
+    let scroller = findByCssName(window, "scrolledwindow")
+    if not scroller.isNil:
+      let adjustment = gtk_scrolled_window_get_vadjustment(scroller)
+      let extent = gtk_adjustment_get_upper(adjustment) -
+        gtk_adjustment_get_page_size(adjustment)
+      gtk_adjustment_set_value(adjustment, max(0.0, extent) * clamp(fraction, 0.0, 1.0))
 
   proc finish(path: string; menu: int; attempts: int) =
     ## Captures once the window has painted, retrying briefly when the widget is
@@ -180,10 +190,22 @@ when defined(ludexSnapshot):
         finish(path, menu, attempts - 1)
         false)
       return
-    let window = firstToplevel()
+    if not saved:
+      quit("Snapshot failed: " & path, 1)
+    let dialog = toplevel(last = true)
+    let window = toplevel()
+    if not dialog.isNil:
+      if cast[pointer](dialog) != cast[pointer](window):
+        if getEnv("LUDEX_SNAPSHOT_DIALOG") in ["open", "diagnostics"]:
+          gtk_dialog_response(dialog, -6) # GTK_RESPONSE_CANCEL; lets Owlkettle read its state.
+        else:
+          gtk_window_close(dialog)
+      g_object_unref(cast[pointer](dialog))
     if not window.isNil:
-      gtk_window_close(window)
-      g_object_unref(cast[pointer](window))
+      discard addGlobalTimeout(50, proc (): bool =
+        gtk_window_close(window)
+        g_object_unref(cast[pointer](window))
+        false)
 
   proc scheduleCapture*(path: string; delayMs: int; hover = false;
                         menu = 0) =
@@ -195,6 +217,9 @@ when defined(ludexSnapshot):
     ## tree rather than an intermediate one. `menu` selects which header menu to
     ## open, counting from one.
     discard addGlobalTimeout(delayMs, proc (): bool =
+      let scroll = getEnv("LUDEX_SNAPSHOT_SCROLL")
+      if scroll.len > 0:
+        scrollContent(parseFloat(scroll))
       if menu > 0:
         discard openMenuButton(menu)
       if hover:

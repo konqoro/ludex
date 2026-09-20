@@ -6,16 +6,15 @@
 ## and widget work independent of catalogue size. Search still covers every game.
 ## Catalog owns disk data, present owns wording, and this module owns interaction.
 
-import std/[options, tables]
+import std/[options, strutils, tables]
 
 import owlkettle
 import owlkettle/adw
-import owlkettle/bindings/gtk
 
 import ludexcore/[models, query, taste]
 import ludexui/[catalog, present, widgets]
 when defined(ludexSnapshot):
-  import std/[os, strutils]
+  import std/os
   import ludexui/snapshot
 
 const
@@ -31,12 +30,12 @@ const
   Osd = StyleClass("osd")
   Body = StyleClass("body")
 
-const ReadingWidth = 820
-  ## The width the game page's column is clamped to. The banner is sized from
-  ## its own picture at this width, so it fills the column exactly rather than
-  ## leaving letterbox bars that a fixed height would.
-
 const GridStyles = """
+.ludex-hero { border-radius: 12px 12px 0 0; }
+.ludex-shot { padding: 0; border-radius: 9px; }
+button.ludex-store { background: @accent_bg_color; color: @accent_fg_color; }
+button.ludex-store:hover { filter: brightness(1.1); }
+button.ludex-store label { text-decoration: none; }
 .ludex-grid > flowboxchild {
   padding: 0;
   background-color: transparent;
@@ -51,7 +50,7 @@ const GridStyles = """
   ## owns the interaction, so the container's copy is dropped and its padding
   ## moves back to the grid's own spacing.
 
-var initialWindowSize* = (1000, 720)
+var initialWindowSize = (1000, 720)
   ## The shipping window size. The development capture build overrides it from
   ## the environment before the window is built.
 
@@ -76,11 +75,14 @@ proc refreshItems(app: AppState) =
   app.items = app.catalog.browse(app.query, app.filters)
   app.page = min(app.page, max(0, (app.items.len - 1) div PageSize))
 
-proc search(app: AppState; text: string) =
-  app.query = text
+proc resetBrowse(app: AppState) =
   app.page = 0
   app.galleryScroll.reset()
   app.refreshItems()
+
+proc search(app: AppState; text: string) =
+  app.query = text
+  app.resetBrowse()
 
 proc closeSearch(app: AppState) =
   app.searching = false
@@ -98,38 +100,32 @@ func filterCount(filters: Filters): int =
     filters.genres.len
 
 func filterTooltip(filters: Filters): string =
-  let count = filterCount(filters)
-  if count == 0: "Filter Games"
-  else: "Filter Games (" & $count & " active)"
+  var active: seq[string]
+  if filters.runsHere: active.add "Runs on Linux"
+  if filters.deckReady: active.add "Steam Deck ready"
+  if filters.unjudged: active.add "Hide games I’ve rated"
+  if filters.genres.len > 0: active.add filters.genres.join(" or ")
+  if active.len == 0: "Filter Games"
+  else: "Filter Games: " & active.join(" · ")
 
 proc clearFilters(app: AppState) =
   app.filters = Filters()
-  app.page = 0
-  app.galleryScroll.reset()
-  app.refreshItems()
+  app.resetBrowse()
 
 proc toggleFilter(app: AppState; kind: FilterKind) =
   case kind
   of fkRunsHere: app.filters.runsHere = not app.filters.runsHere
   of fkDeckReady: app.filters.deckReady = not app.filters.deckReady
   of fkUnjudged: app.filters.unjudged = not app.filters.unjudged
-  app.page = 0
-  app.galleryScroll.reset()
-  app.refreshItems()
+  app.resetBrowse()
 
 proc toggleGenre(app: AppState; genre: string) =
-  var index = -1
-  for position, name in app.filters.genres:
-    if name == genre:
-      index = position
-      break
+  let index = app.filters.genres.find(genre)
   if index >= 0:
     app.filters.genres.delete(index)
   else:
     app.filters.genres.add genre
-  app.page = 0
-  app.galleryScroll.reset()
-  app.refreshItems()
+  app.resetBrowse()
 
 proc reload(app: AppState) =
   app.catalog = loadCatalog(app.catalog.paths)
@@ -157,36 +153,17 @@ proc openGame(app: AppState; release: Release) =
   app.selected = some release
   app.viewer = none(int)
 
-type GameArt = object
-  background: Option[string] ## the store's wide page art, when downloaded
-  header: Option[string] ## the 460x215 list image, when downloaded
-  shots: seq[string] ## every screenshot file, in order
+proc gameArt(app: AppState; release: Release): ArtFiles =
+  app.catalog.artFiles(release.appid.get(0))
 
-proc gameArt(app: AppState; release: Release): GameArt =
-  ## The picture files for one game. Paths rather than bitmaps, because the
-  ## window shows the same picture at two sizes: a thumbnail in the strip and
-  ## the untouched file in the viewer.
-  let files = app.catalog.artFiles(release.appid.get(0))
-  result.background = files.background
-  result.header = files.header
-  result.shots = files.shots
-
-func banner(art: GameArt): Option[string] =
-  ## What the top picture shows. The store's wide page art is preferred because
-  ## the header is only 460x215 and looks soft when the page draws it large; the
-  ## header is the fallback, and the first screenshot the last resort.
+func banner(art: ArtFiles): Option[string] =
+  # Prefer page art; the store header is only 460×215.
   if art.background.isSome:
     result = art.background
   elif art.header.isSome:
     result = art.header
   elif art.shots.len > 0:
     result = some art.shots[0]
-
-func media(art: GameArt): seq[string] =
-  ## What the viewer can show, which is the screenshots. The banner is left out
-  ## deliberately: the store sends it at 460x215, so showing it "full size" would
-  ## be smaller than the page already draws it.
-  art.shots
 
 proc openViewer(app: AppState; index: int) =
   app.viewer = some index
@@ -198,7 +175,7 @@ proc stepViewer(app: AppState; delta: int) =
   ## Moving past either end stays put rather than wrapping.
   if app.selected.isNone or app.viewer.isNone:
     return
-  let count = media(app.gameArt(app.selected.get)).len
+  let count = app.gameArt(app.selected.get).shots.len
   if count == 0:
     return
   app.viewer = some max(0, min(count - 1, app.viewer.get + delta))
@@ -240,11 +217,7 @@ proc searchToggle(app: AppState): Widget =
           app.closeSearch()
 
 proc mainMenu(app: AppState): Widget =
-  ## The primary menu: app-wide commands, then the standard About item in its
-  ## own group. The `.menu` popover style is what gives the rows Adwaita's
-  ## full-width padding and hover; without it the items render as bare buttons.
-  ## Narrowing the collection is not an app-wide command, so it lives behind its
-  ## own filter button instead of being buried here.
+  # The primary menu contains app-wide actions; filters have their own menu.
   result = gui:
     MenuButton:
       icon = "open-menu-symbolic"
@@ -269,22 +242,18 @@ proc mainMenu(app: AppState): Widget =
             proc clicked() = app.showAbout()
 
 proc filterMenu(app: AppState): Widget =
-  ## Filtering narrows the whole collection at once, so it gets its own control
-  ## rather than an entry buried in the main menu. Every row is a checkable menu
-  ## item, and GTK keeps a check-role popover open, so several questions can be
-  ## answered in one visit. Genres come from the catalogue: a game's own store
-  ## genres, or nothing when the store never answered, in which case a genre
-  ## filter never counts it as a match.
-  ##
-  ## The icon is `view-more-symbolic`, GNOME's secondary-menu icon: a set of view
-  ## options is exactly a secondary menu, and the Adwaita theme here ships no
-  ## funnel to name it more literally.
+  # A labeled library control; check-role items keep it open for multiple choices.
   let genres = app.catalog.genreOptions()
   result = gui:
     MenuButton:
-      icon = "view-more-symbolic"
       tooltip = filterTooltip(app.filters)
       style = [ButtonFlat]
+      Box(orient = OrientX, spacing = 6):
+        Label:
+          text = if filtersActive(app.filters): "Filters (" & $filterCount(app.filters) & ")"
+                 else: "Filters"
+        Icon {.expand: false.}:
+          name = "pan-down-symbolic"
       Popover:
         style = [Menu]
         Box(orient = OrientY, margin = 6):
@@ -322,7 +291,7 @@ proc viewerTitle(app: AppState): string =
   ## "3 of 12": where the picture sits in the game's gallery.
   if app.selected.isNone or app.viewer.isNone:
     return "Ludex"
-  let count = media(app.gameArt(app.selected.get)).len
+  let count = app.gameArt(app.selected.get).shots.len
   if count == 0:
     return "Ludex"
   $min(app.viewer.get + 1, count) & " of " & $count
@@ -334,12 +303,23 @@ proc header(app: AppState): Widget =
   result = gui:
     AdwHeaderBar:
       WindowTitle {.addTitle.}:
-        title = app.viewerTitle()
+        title = if app.selected.isNone and app.searching: "Search Results"
+                else: app.viewerTitle()
+        subtitle = if app.selected.isNone and app.catalog.hasGames():
+                     $app.items.len & " games"
+                   else: ""
       if app.selected.isSome:
         insert(backButton(app)) {.addLeft.}
       else:
         insert(searchToggle(app)) {.addLeft.}
-        insert(filterMenu(app)) {.addRight.}
+        if app.catalog.hasGames():
+          insert(filterMenu(app)) {.addLeft.}
+          if filtersActive(app.filters):
+            Button {.addLeft.}:
+              icon = "edit-clear-symbolic"
+              tooltip = "Clear Filters"
+              style = [ButtonFlat]
+              proc clicked() = app.clearFilters()
         insert(mainMenu(app)) {.addRight.}
 
 proc searchField(app: AppState): Widget =
@@ -381,6 +361,7 @@ proc emptySearch(app: AppState): Widget =
       Box(orient = OrientY):
         Button {.expand: false, hAlign: AlignCenter.}:
           text = "Clear Search"
+          style = [ButtonPill]
           proc clicked() = app.search("")
 
 proc emptyFiltered(app: AppState): Widget =
@@ -394,72 +375,85 @@ proc emptyFiltered(app: AppState): Widget =
       Box(orient = OrientY):
         Button {.expand: false, hAlign: AlignCenter.}:
           text = "Clear Filters"
+          style = [ButtonPill]
           proc clicked() = app.clearFilters()
+
+const LibraryStyles = """
+button.ludex-tile { padding: 12px; }
+"""
 
 proc gameTile(app: AppState; item: BrowseItem): Widget =
   let release = item.release
   let files = app.catalog.artFiles(release.appid.get(0))
-  let art = if files.header.isSome: app.picture(files.header.get, 240)
+  let art = if files.header.isSome: app.picture(files.header.get, 220)
             else: none(Pixbuf)
   let genres = gameGenres(storeFactsOf(app.catalog.stores, release))
   let loved = app.catalog.taste.verdictOf(release.appid.get(0)) == some vLoved
   result = gui:
     Button:
-      style = [ButtonFlat]
+      style = [BoxCard, StyleClass("ludex-tile")]
       tooltip = release.title
-      Box(orient = OrientY, spacing = 8):
-        sizeRequest = (240, -1)
+      Box(orient = OrientY, spacing = 12):
+        sizeRequest = (220, -1)
         if art.isSome:
           Picture {.expand: false.}:
             pixbuf = art.get
             contentFit = ContentCover
-            sizeRequest = (240, 112)
+            sizeRequest = (220, 120)
         else:
           Box {.expand: false.}:
             orient = OrientY
-            sizeRequest = (240, 112)
+            sizeRequest = (220, 120)
             Avatar {.hAlign: AlignCenter, vAlign: AlignCenter.}:
               text = release.title
-              size = 56
+              size = 64
               showInitials = true
-        Box(orient = OrientX, spacing = 6):
-          BoundedLabel {.expand: true.}:
-            text = release.title
-            xAlign = 0
-            maxChars = 22
-            ellipsize = EllipsizeEnd
-            style = [StyleClass("heading")]
-          if loved:
-            Icon {.expand: false, vAlign: AlignCenter.}:
-              name = "starred-symbolic"
-              pixelSize = 14
-              tooltip = "You loved this"
-              style = [Accent]
-        if genres.len > 0:
-          BoundedLabel {.expand: false.}:
-            text = genres
-            xAlign = 0
-            maxChars = 26
-            ellipsize = EllipsizeEnd
-            style = [Caption, Dim]
+        Box {.expand: false.}:
+          orient = OrientY
+          spacing = 4
+          Box {.expand: false.}:
+            orient = OrientX
+            spacing = 6
+            BoundedLabel:
+              text = release.title
+              xAlign = 0
+              maxChars = 22
+              ellipsize = EllipsizeEnd
+              style = [StyleClass("heading")]
+            if loved:
+              Icon {.expand: false, vAlign: AlignCenter.}:
+                name = "starred-symbolic"
+                pixelSize = 16
+                tooltip = "You loved this"
+                style = [Accent]
+          if genres.len > 0:
+            BoundedLabel {.expand: false.}:
+              text = genres
+              xAlign = 0
+              maxChars = 26
+              ellipsize = EllipsizeEnd
+              style = [Caption, Dim]
       proc clicked() = app.openGame(release)
 
 proc pagination(app: AppState): Widget =
   let pages = (app.items.len + PageSize - 1) div PageSize
   result = gui:
     Box(orient = OrientX, spacing = 18):
+      margin = Margin(top: 6, bottom: 6)
       Button {.expand: false.}:
         icon = "go-previous-symbolic"
+        style = [ButtonCircular]
         tooltip = "Previous Games"
         sensitive = app.page > 0
         proc clicked() =
           dec app.page
           app.galleryScroll.reset()
-      Label:
+      Label {.expand: false.}:
         text = $(app.page + 1) & " / " & $pages
-        style = [Caption, Dim]
+        style = [Dim]
       Button {.expand: false.}:
         icon = "go-next-symbolic"
+        style = [ButtonCircular]
         tooltip = "More Games"
         sensitive = app.page + 1 < pages
         proc clicked() =
@@ -480,55 +474,19 @@ proc collection(app: AppState): Widget =
       memory = app.galleryScroll
       Clamp:
         maximumSize = 1120
-        Box(orient = OrientY, spacing = 18):
-          margin = Margin(top: 18, bottom: 24, left: 12, right: 12)
-          Box {.expand: false.}:
-            orient = OrientX
-            spacing = 12
-            margin = Margin(left: 12, right: 12)
-            Box(orient = OrientY, spacing = 3):
-              Label {.expand: false.}:
-                text = if app.query.len > 0: "Search Results" else: "Find Your Next Game"
-                xAlign = 0
-                wrap = true
-                style = [LabelTitle2]
-              if filtersActive(app.filters):
-                Label {.expand: false.}:
-                  text = $app.items.len & " games match your filters"
-                  xAlign = 0
-                  style = [Caption, Dim]
-            if filtersActive(app.filters):
-              Button {.expand: false, vAlign: AlignCenter.}:
-                text = "Clear Filters"
-                tooltip = "Show every game again"
-                proc clicked() = app.clearFilters()
+        Box(orient = OrientY, spacing = 24):
+          margin = Margin(top: 18, bottom: 30, left: 18, right: 18)
           FlowBox {.expand: false.}:
             style = [Grid]
-            columns = 1..5
+            columns = 1..4
             homogeneous = true
-            rowSpacing = 16
-            columnSpacing = 16
+            rowSpacing = 18
+            columnSpacing = 18
             selectionMode = SelectionNone
             for index in first..<last:
               insert(gameTile(app, app.items[index]))
           if app.items.len > PageSize:
             insert(pagination(app)) {.expand: false, hAlign: AlignCenter.}
-
-proc gtk_show_uri(display: pointer; uri: cstring; timestamp: cuint): cbool
-  {.importc, cdecl.}
-
-proc openUri(uri: string) =
-  ## The one action Ludex can honestly offer: the game's Steam page.
-  if uri.len > 0:
-    discard gtk_show_uri(cast[pointer](gdk_display_get_default()), uri.cstring, 0)
-
-proc toneStyle(tone: CompatibilityTone): StyleClass =
-  ## Adwaita's semantic colors, which follow light, dark and high contrast.
-  case tone
-  of toneNegative: Danger
-  of toneCaution: Caution
-  of tonePositive: Success
-  else: Dim
 
 proc ratingRow(app: AppState; release: Release): Widget =
   ## The verdict as a boxed-list row with a drop-down control, the same shape
@@ -540,20 +498,19 @@ proc ratingRow(app: AppState; release: Release): Widget =
   let selected = if current.isSome: ord(current.get) + 1 else: 0
   result = gui:
     PreferencesGroup:
-      ActionRow:
+      ComboRow:
         title = "Your rating"
         subtitle = "Shape future suggestions"
-        DropDown {.addSuffix.}:
-          items = items
-          selected = selected
-          proc select(item: int) =
-            if item <= 0:
-              if app.catalog.clearRating(release.appid.get):
-                app.refreshItems()
-              else:
-                app.toasts.add(newToast("Rating wasn’t cleared. Check your ratings file and try again."))
+        items = items
+        selected = selected
+        proc select(item: int) =
+          if item <= 0:
+            if app.catalog.clearRating(release.appid.get):
+              app.refreshItems()
             else:
-              app.rateGame(release, Verdict(item - 1))
+              app.toasts.add(newToast("Rating wasn’t cleared. Check your ratings file and try again."))
+          else:
+            app.rateGame(release, Verdict(item - 1))
 
 proc infoRow(title, subtitle: string): Widget =
   ## One labelled fact, the standard boxed-list row. A row's title and subtitle
@@ -564,29 +521,21 @@ proc infoRow(title, subtitle: string): Widget =
       subtitle = escapeMarkup(subtitle)
 
 proc statusRow(title, subtitle: string; tone: CompatibilityTone): Widget =
-  ## A fact whose state is carried by a symbolic icon as well as its wording, so
-  ## color is never the only signal.
+  # Wording and an icon carry the status independently of color.
+  let indicator = case tone
+    of tonePositive: ("object-select-symbolic", Success)
+    of toneCaution: ("dialog-warning-symbolic", Caution)
+    of toneNegative: ("dialog-error-symbolic", Danger)
+    else: ("", Dim)
   result = gui:
     ActionRow:
       title = escapeMarkup(title)
       subtitle = escapeMarkup(subtitle)
-      case tone
-      of tonePositive:
+      if indicator[0].len > 0:
         Icon {.addSuffix.}:
-          name = "object-select-symbolic"
+          name = indicator[0]
           pixelSize = 16
-          style = [Success]
-      of toneCaution:
-        Icon {.addSuffix.}:
-          name = "dialog-warning-symbolic"
-          pixelSize = 16
-          style = [Caution]
-      of toneNegative:
-        Icon {.addSuffix.}:
-          name = "dialog-error-symbolic"
-          pixelSize = 16
-          style = [Danger]
-      else: discard
+          style = [indicator[1]]
 
 proc shotButton(app: AppState; path: string; index: int): Widget =
   ## A thumbnail that opens the full-window viewer at its own position. Decoded
@@ -594,16 +543,20 @@ proc shotButton(app: AppState; path: string; index: int): Widget =
   let shot = app.picture(path, 320)
   result = gui:
     Button:
-      style = [ButtonFlat]
-      tooltip = "View Screenshot"
+      tooltip = "View Screenshot " & $(index + 1)
+      style = [ButtonFlat, StyleClass("ludex-shot")]
       if shot.isSome:
         Picture:
           pixbuf = shot.get
           contentFit = ContentCover
           sizeRequest = (272, 153)
+      else:
+        Icon:
+          name = "image-missing-symbolic"
+          sizeRequest = (272, 153)
       proc clicked() = app.openViewer(index)
 
-proc shotStrip(app: AppState; art: GameArt): Widget =
+proc shotStrip(app: AppState; art: ArtFiles): Widget =
   ## A strip rather than a wall: the screenshots sit with the banner where they
   ## are seen, and one click opens any of them larger.
   result = gui:
@@ -668,8 +621,8 @@ proc detailsGroup(facts: SteamFacts): Widget =
         insert(infoRow("Tags", tags))
 
 proc game(app: AppState): Widget =
-  ## The picture is the identity, the ratings are the answer, the screenshots
-  ## are the evidence, and the rest is detail.
+  ## Artwork, identity and the store action share one native card.
+  ## A single clamp keeps the header and supporting information aligned.
   let release = app.selected.get
   let art = app.gameArt(release)
   let facts = storeFactsOf(app.catalog.stores, release)
@@ -681,70 +634,66 @@ proc game(app: AppState): Widget =
   let hero = if heroPath.isSome: app.picture(heroPath.get, 960)
              else: none(Pixbuf)
   let hasRatings = compatibilitySummary(release, play, facts).len > 0 or
-    reviewSummary(facts).len > 0
-  let hasDetails = priceText(facts).len > 0 or facts.developers.len > 0 or
-    facts.releaseDate.isSome or facts.tags.isSome
-  ## A picture's own aspect decides how tall the banner is, so nothing is
-  ## stretched and no bars appear; narrower windows crop the sides instead.
-  let heroHeight =
-    if hero.isSome and height(hero.get) > 0:
-      min(max(int(float(ReadingWidth) *
-        float(height(hero.get)) / float(width(hero.get))), 200), 560)
-    else:
-      380
+    reviewSummary(facts).len > 0 or criticsSummary(facts).len > 0
+  let hasDetails = priceText(facts).len > 0 or firstOf(facts.developers).len > 0 or
+    (facts.releaseDate.isSome and facts.releaseDate.get.value.len > 0) or
+    tagSummary(facts, 6).len > 0
   result = gui:
     ScrolledWindow:
       Clamp:
-        maximumSize = ReadingWidth
+        maximumSize = 820
         Box(orient = OrientY, spacing = 24):
-          margin = Margin(top: 24, bottom: 36, left: 18, right: 18)
-          if hero.isSome:
-            Picture {.expand: false.}:
-              pixbuf = hero.get
-              contentFit = ContentCover
-              sizeRequest = (-1, heroHeight)
-          else:
-            Box {.expand: false.}:
-              orient = OrientY
-              sizeRequest = (-1, 120)
-              Avatar {.hAlign: AlignCenter, vAlign: AlignCenter.}:
-                text = release.title
-                size = 96
-                showInitials = true
+          margin = Margin(top: 12, bottom: 36, left: 18, right: 18)
           Box {.expand: false.}:
             orient = OrientY
-            spacing = 6
-            Label {.expand: false.}:
-              text = release.title
-              xAlign = 0
-              wrap = true
-              style = [LabelTitle1]
-            if subtitle.len > 0:
-              Label {.expand: false.}:
-                text = subtitle
-                xAlign = 0
-                wrap = true
-                style = [Dim]
-          if url.len > 0:
+            style = [BoxCard]
+            if hero.isSome:
+              Picture {.expand: false.}:
+                pixbuf = hero.get
+                contentFit = ContentCover
+                sizeRequest = (-1, 220)
+                style = [StyleClass("ludex-hero")]
             Box {.expand: false.}:
-              orient = OrientX
-              spacing = 12
-              Button {.expand: false.}:
-                text = "View on Steam"
-                style = [ButtonSuggested, ButtonPill]
-                proc clicked() = openUri(url)
+              orient = OrientY
+              spacing = 16
+              margin = 24
+              if hero.isNone:
+                Avatar {.expand: false, hAlign: AlignStart.}:
+                  text = release.title
+                  size = 64
+                  showInitials = true
+              Box {.expand: false.}:
+                orient = OrientY
+                spacing = 6
+                Label {.expand: false.}:
+                  text = release.title
+                  xAlign = 0
+                  wrap = true
+                  style = [LabelTitle1]
+                if subtitle.len > 0:
+                  Label {.expand: false.}:
+                    text = subtitle
+                    xAlign = 0
+                    wrap = true
+                    style = [Dim]
+              if url.len > 0:
+                LinkButton {.expand: false, hAlign: AlignStart.}:
+                  text = "View on Steam"
+                  uri = url
+                  style = [ButtonSuggested, ButtonPill, StyleClass("ludex-store")]
           if blurb.len > 0:
             Label {.expand: false.}:
               text = blurb
               xAlign = 0
               wrap = true
+              margin = Margin(left: 12, right: 12)
               style = [Body]
           if hasRatings:
             insert(ratingsGroup(release, play, facts)) {.expand: false.}
-          if art.shots.len > 0:
-            insert(shotStrip(app, art)) {.expand: false.}
           if release.appid.get(0) > 0:
             insert(ratingRow(app, release)) {.expand: false.}
+          if art.shots.len > 0:
+            insert(shotStrip(app, art)) {.expand: false.}
           if hasDetails:
             insert(detailsGroup(facts)) {.expand: false.}
 
@@ -758,7 +707,9 @@ proc navButton(app: AppState; icon, tooltip, shortcut: string;
       tooltip = tooltip
       shortcut = shortcut
       style = [ButtonCircular, Osd]
-      margin = 24
+      margin = 12
+      sensitive = if delta < 0: app.viewer.get(0) > 0
+                  else: app.viewer.get(0) + 1 < app.gameArt(app.selected.get).shots.len
       proc clicked() = app.stepViewer(delta)
 
 proc viewer(app: AppState): Widget =
@@ -766,8 +717,13 @@ proc viewer(app: AppState): Widget =
   ## the edges and the position in the header. The file is shown at its own size
   ## and never blown up, so it stays sharp.
   let art = app.gameArt(app.selected.get)
-  let items = media(art)
+  let items = art.shots
   let index = max(0, min(items.len - 1, app.viewer.get(0)))
+  if items.len == 0:
+    return gui:
+      StatusPage:
+        iconName = "image-missing-symbolic"
+        title = "No Screenshots"
   let image = app.picture(items[index], 0)
   result = gui:
     Box(orient = OrientY):
@@ -777,6 +733,11 @@ proc viewer(app: AppState): Widget =
           Picture:
             pixbuf = image.get
             contentFit = ContentScaleDown
+        else:
+          StatusPage:
+            iconName = "image-missing-symbolic"
+            title = "Picture Unavailable"
+            description = "This screenshot could not be read."
         if items.len > 1:
           insert(navButton(app, "go-previous-symbolic",
             "Previous Picture (Left Arrow)", "<Left>", -1)) {.addOverlay,
@@ -815,13 +776,14 @@ proc showDetails(app: AppState) =
       title = "Diagnostics"
       defaultSize = (560, 420)
       ScrolledWindow:
-        Box(orient = OrientY, spacing = 12, margin = 18):
-          for problem in app.catalog.problems:
-            Label {.expand: false.}:
-              text = problem
-              xAlign = 0
-              wrap = true
-              style = [Caption]
+        Clamp:
+          maximumSize = 560
+          Box(orient = OrientY, spacing = 18, margin = 24):
+            for problem in app.catalog.problems:
+              Label {.expand: false.}:
+                text = problem
+                xAlign = 0
+                wrap = true
       DialogButton {.addButton.}:
         text = "Close"
         res = DialogClose
@@ -874,6 +836,15 @@ when defined(ludexSnapshot):
     if sceneDone:
       return
     sceneDone = true
+    let dialog = getEnv("LUDEX_SNAPSHOT_DIALOG")
+    if dialog.len > 0:
+      discard addGlobalTimeout(400, proc (): bool =
+        case dialog
+        of "about": app.showAbout()
+        of "diagnostics": app.showDetails()
+        of "open": app.chooseCatalog()
+        else: discard
+        false)
     for name in sceneFilters.split(','):
       case name
       of "runs": app.toggleFilter(fkRunsHere)
@@ -889,6 +860,8 @@ when defined(ludexSnapshot):
     if sceneQuery.len > 0:
       app.searching = true
       app.search(sceneQuery)
+    if getEnv("LUDEX_SNAPSHOT_FIRST").len > 0 and app.items.len > 0:
+      app.openGame(app.items[0].release)
     if sceneViewer >= 0:
       app.openViewer(sceneViewer)
       if sceneCloseViewer:
@@ -896,12 +869,15 @@ when defined(ludexSnapshot):
         ## where Owlkettle's update path runs over a changing tree.
         discard addGlobalTimeout(250, proc (): bool =
           app.stepViewer(1)
+          discard app.redraw()
           false)
         discard addGlobalTimeout(400, proc (): bool =
           app.closeViewer()
+          discard app.redraw()
           false)
         discard addGlobalTimeout(550, proc (): bool =
           app.openViewer(sceneViewer)
+          discard app.redraw()
           false)
 
   proc readSceneEnv() =
@@ -926,12 +902,14 @@ when defined(ludexSnapshot):
         menu = parseInt(getEnv("LUDEX_SNAPSHOT_MENU", "0")))
 
 when isMainModule:
-  let loaded = loadCatalog(defaultPaths())
   when defined(ludexSnapshot):
+    let path = getEnv("LUDEX_SNAPSHOT_CATALOG", "data/releases.jsonl")
+    let loaded = loadCatalog(catalogPathsFor(path))
     readSceneEnv()
     adw.brew(gui(App(catalog = loaded, items = loaded.browse(""))),
       colorScheme = sceneColorScheme,
-      stylesheets = @[newStylesheet(GridStyles)])
+      stylesheets = @[newStylesheet(GridStyles & LibraryStyles)])
   else:
+    let loaded = loadCatalog(defaultPaths())
     adw.brew(gui(App(catalog = loaded, items = loaded.browse(""))),
-      stylesheets = @[newStylesheet(GridStyles)])
+      stylesheets = @[newStylesheet(GridStyles & LibraryStyles)])
