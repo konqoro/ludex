@@ -51,8 +51,8 @@ bin/ludex list --store data/releases.jsonl --lang ENG --title disco
 bin/ludex show 632470 --store data/releases.jsonl
 
 # Ask how the games actually run. ProtonDB is one request per game, so start
-# small: it pauses between requests, can be capped or rerun, and every answer
-# is cached.
+# small: each request is held back until --delay has passed since the last one
+# (paced, not bursted), a sweep can be capped or rerun, and every answer is cached.
 bin/ludex enrich --store data/releases.jsonl --limit 60
 bin/ludex list --store data/releases.jsonl --tier gold
 
@@ -80,7 +80,7 @@ bin/ludex list --store data/releases.jsonl --tag puzzle
 # The store also says what the game looks like, and `enrich --source steam`
 # records those URLs. `art` downloads the pictures next to the data, so the
 # window can show them without ever opening a socket.
-bin/ludex art --limit 50        # header image + screenshot thumbnails per game
+bin/ludex art --limit 50        # page art, header and screenshots, a few at a time
 bin/ludex art                   # the rest; already-downloaded files are skipped
 
 # Say what you thought of a few games, then ask what to play.
@@ -124,7 +124,9 @@ Run `bin/ludex help` for the full option list.
 
 `enrich` writes `data/enrichment.jsonl` and caches every response under `data/cache`, so a
 second run asks for nothing. `--offline` runs from the cache alone, `--refresh` ignores it,
-and `--delay`/`--limit` keep a sweep civil. What a game is worth:
+and `--delay`/`--limit` keep a sweep civil: up to four requests may be in flight, but
+`--delay` is a floor between them, so the source sees a fixed rate rather than a burst.
+What a game is worth:
 
 ```
 {"appid":1264280,"play":{"tier":{"value":"platinum","source":"protondb","fetchedAt":1789821650,"confidence":1.0},"tierScore":{"value":0.71,"source":"protondb","fetchedAt":1789821650,"confidence":1.0},"reports":{"value":31,"source":"protondb","fetchedAt":1789821650,"confidence":1.0},"tierConfidence":"strong"}}

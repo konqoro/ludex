@@ -19,6 +19,8 @@ nimcache/
 # Agent tool state (crush.db grows to tens of megabytes per machine)
 /.crush/
 **/.crush/
+# Agent session state, including pasted tasks (this session's own scratch area)
+/.codewhale/
 
 # Scratch copies of the tree used for prototyping (symlinks data/ and deps/)
 /redesign/

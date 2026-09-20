@@ -339,7 +339,7 @@ the fallback path for rows without the marker.
    `confidence < 0.6` and are surfaced in a `ludex review-matches` queue for a human
    decision — never silently guessed. Collections get one key plus child keys.
 
-### 7.4 Fetch (implemented: `src/ludexingest/fetch.nim`)
+### 7.4 Fetch (implemented: `src/ludexingest/{cache,fetch,pacer}.nim`)
 
 One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), with
 `-d:ssl`:
@@ -356,25 +356,62 @@ One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), wi
   The status is cached, not just the body, because `404` from ProtonDB means "nobody has
   reported this game" and is worth remembering instead of re-asking. A corrupt cache file
   is a miss, not an exception. `--refresh` ignores the cache; `--offline` never opens a
-  socket and fails on a miss, which is what the tests use.
-- **Politeness.** A *pacer* holds each request back until `--delay` (default 250 ms,
-  per-source) has elapsed since the previous submission, so a source publishing a request
-  budget sees a fixed rate whether the sweep is ten URLs or four thousand. A hard `--limit`
-  makes a sweep partial. A descriptive `User-Agent` with a contact URL. Retries `429` and
-  `5xx` with exponential backoff, then gives up on that game.
-- **Overlap, not a rate limit.** A concurrency bound and a rate limit are different
-  promises. `relay`'s `maxInFlight` (four) says "no more than four sockets open"; it does
-  not stop four fast answers from arriving in a burst, which is what gets an address
-  throttled. So `fetchAll` streams URLs through the pacer one submission at a time and
-  drains completions as they arrive. The delay is a floor, and `maxInFlight` only hides
-  the latency of a slow source when the answer takes longer than the delay. This is why the
-  batch is not handed to `relay` at once: that would defeat the pacer.
+  socket and fails on a miss, which is what the tests use. Answers are remembered,
+  problems are not: a cached `429` or `5xx` would be a lie the next run believes, so the
+  run that meets one is the run that retries it.
+- **Three promises, three types.** A concurrency bound and a rate limit are not the same
+  promise, and they are no longer one loop:
+  - `relay`'s `maxInFlight` (four) is *transport*: no more than four sockets open.
+  - The `Pacer` (`pacer.nim`) is the *rate limit*: one submission per `--delay` (default
+    250 ms, per source), measured from the previous admission, so a fast answer cannot
+    turn a fixed budget into a burst and a slow one cannot add to the spacing. It belongs
+    to the client, because it is a property of the source being asked, and it therefore
+    survives across batches: two batches against one source cannot double its rate.
+  - The `Sweep` (`fetch.nim`) is the *batch*: it owns the pending URLs, the client's
+    window while it runs, and the outcomes.
+- **Politeness, measured.** The delay is per submission, not per round and not per
+  completion, and the pacer's clock is a parameter rather than a call, so the floor is
+  pinned by a test (`tests/tpacer.nim`) instead of asserted. Against a local timestamping
+  server, nine URLs at 1600 ms arrive 1600.1 ms apart on average (min 1599.7, max 1600.7),
+  and three URLs whose answers take 2.5 s each are still admitted 1600 ms apart rather
+  than 2500 ms — overlap is used (`inflight=2` on the server) *and* the floor holds. A
+  hard `--limit` makes a sweep partial. A descriptive `User-Agent` with a contact URL.
+- **Overlap.** `relay` says how many sockets may be open, the pacer says how often one may
+  be used, and neither is a rate limit on its own. Because the two are separate, the batch
+  is streamed into relay one admitted request at a time instead of being handed over whole:
+  relay's own queue is unbounded, so a whole-catalogue handoff would neither bound memory
+  nor let the sweep notice a source refusing before the queue drained. Measured with a
+  50 ms delay and 800 ms answers, twelve URLs peak at exactly four concurrent requests on
+  the server and finish in 3.9 s.
+- **One outcome at a time.** The primitive is a stream: `initSweep` plus `next` yields one
+  outcome per URL in completion order, each naming the request it belongs to (`key`, the
+  URL's position in the batch, and the URL), so a caller can write a body out and drop it.
+  Memory is bounded by `maxInFlight` bodies rather than by the sweep: measured, 200 × 1 MB
+  pictures cost about 13 MB of RSS over the process baseline, while the same 200 through
+  `fetchAll` — the small-batch convenience that holds every body and says so — cost 206 MB.
+  Reordering into submission order is what that trade would cost, so the streaming form
+  deliberately does not offer it.
 - **Failure handling.** Any per-game failure is recorded with its reason and the run
-  continues; `fetchAll` returns an outcome per URL, so an answer and its absence never
-  occupy separate parallel arrays. The client's own error is `FetchError`; `relay`'s
-  transport errors are values and its lifecycle errors are `IOError`, translated to
-  `FetchError` at this boundary and only here, with `Defect` re-raised so a programming bug
-  is never recorded as a source outage.
+  continues. An outcome is either an answer or the reason there is none, never both, and
+  one URL's failure never discards another's answer: a batch is not all-or-nothing. A
+  transport failure is a problem; a transient status (`429`, `5xx`) earns up to four
+  attempts with exponential backoff and is then a problem naming the status. Measured: a
+  URL answering `429` twice and then `200` ends as an answer after three requests with
+  801 ms and 1301 ms gaps; a URL answering `500` forever ends as a problem after four
+  attempts, and is not cached. A `429` also holds *every* admission back, because a source
+  that refuses us is telling us our idea of its budget is too generous. The client's own
+  error is `FetchError`, raised only for a client-level fault (a stopped relay, or a
+  silence longer than twice relay's own request timeout); `relay`'s transport errors are
+  values, and `Defect` is never caught, so a programming bug is never recorded as a source
+  outage.
+- **Rejected: a token bucket.** A bucket of capacity c allows c submissions at once and
+  then the same average. Both ends were measured: with the floor removed, five URLs arrive
+  within a millisecond of each other, so the burst a bucket would spend is real; but the
+  sweeps this delay exists for are thousands of requests long, where the average governs —
+  a 6180-request Steam sweep spends about 2h45m at the floor, so a capacity-4 bucket buys
+  the first 4.8 s (0.05%) while permitting four extra requests inside the window budget the
+  floor is there to respect. `Pacer.hold` keeps the useful half of a bucket: a 429 pushes
+  every admission back, which is the part that responds to a source actually complaining.
 - **Cost of the dependency.** `relay` shares `ref` objects across its worker thread, so it
   requires `--threads:on` and `--mm:atomicArc`, and it binds libcurl without linking it.
   Nim has no per-module memory model and `nimble`/Atlas do not propagate a dependency's
@@ -382,10 +419,8 @@ One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), wi
   `-DCURL_DISABLE_TYPECHECK` for the Fedora curl 8.16+ header bug) and apply to the whole
   build, including the UI that never opens a socket. That is a known, accepted cost.
 - **Still to come:** ETag/Last-Modified revalidation and `--max-age` (the cache is
-  currently valid until `--refresh`), and a token bucket in place of the fixed pacer so a
-  short burst is allowed within a longer average budget. `ludex art` still fetches one
-  picture at a time: batching it would hold every image body in memory, so it needs a
-  chunked stream before it can use `fetchAll`. OpenCritic at 200/day stays an on-demand
+  currently valid until `--refresh`), and a cache cap or eviction policy now that a
+  re-run can be made cheap by a warm cache alone. OpenCritic at 200/day stays an on-demand
   source, never a bulk one.
 
 ### 7.5 What ProtonDB actually returns (implemented)
@@ -971,6 +1006,17 @@ Implemented, and the numbers in §3 are these assertions:
   different source's facts surviving a merge, malformed responses recorded rather than
   fatal, and the pictures surviving decode, merge and store as the regression for a merge
   that names every field by hand.
+- **Batch boundary tests** (`tests/tfetch.nim`) exercise `ludexingest/fetch.nim` offline,
+  which is what makes them deterministic: one outcome per URL keyed by the position it was
+  added at, an answer and a problem that are never both set, a `404` that is an answer, a
+  cache hit that sends nothing, an offline miss that is a problem rather than a request, a
+  corrupt entry that is a miss, `refresh` ignoring the cache, and the drain signal —
+  `next` handing back every URL exactly once and then `none`.
+- **Rate limit tests** (`tests/tpacer.nim`) pin the floor with an injected clock, because
+  the promise is about the network and a test suite may not sleep through it: the first
+  submission is immediate, then one per `delayMs`, measured from the previous admission
+  rather than the previous answer, a zero delay never holds anything back, and a `429`
+  hold only ever extends the wait.
 - **Taste tests** (`tests/ttaste.nim`) cover the verdict vocabulary, replacement and
   removal of ratings, which verdicts gate and which do not, unit-length scaling, that a game
   with many tags does not outweigh one with few, that loved pulls and bounced pushes, that

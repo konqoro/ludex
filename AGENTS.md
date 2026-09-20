@@ -66,14 +66,14 @@ siblings: neither imports the other.
 |---|---|---|
 | Core | `src/ludexcore/` | Pure. **No I/O, network, threads, or FFI.** String in, string out. |
 | Source decoders | `src/ludexcore/sources/` | Pure. Turn a recorded response body into facts. |
-| Ingest | `src/ludexingest/` | Owns HTTP, cache, rate limiting: `fetch.nim` for the client, `enrich.nim` for facts and `artcache.nim` for pictures. |
+| Ingest | `src/ludexingest/` | Owns HTTP, cache, rate limiting: `fetch.nim` for the client and its batch primitive, `cache.nim` for the on-disk response format, `pacer.nim` for the rate limit, `enrich.nim` for facts and `artcache.nim` for pictures. |
 | CLI | `src/ludex.nim` | Owns the file system and the network. |
 | UI | `src/ludexui/` | owlkettle/GTK4. `catalog.nim` owns the file system, `present.nim` is pure, `app.nim` is layout only. No network: enrichment and pictures are CLI jobs, the window reads what they wrote. |
 
 - `ludexcore` must not `import std/os`. This is why the tests need no fixtures on disk
   and run offline. If you need a file read, do it in `src/ludex.nim` or
   `src/ludexingest/` and pass strings down.
-- `fetch.nim` is the only module that performs network I/O. It uses `relay` (libcurl multi), whose four build settings are explained in `docs/DESIGN.md` §7.4. The per-source delay is a real rate limit applied per submission by a pacer, not a per-round sleep; `maxInFlight` only overlaps requests the pacer already admitted.
+- `fetch.nim` is the only module that performs network I/O. It uses `relay` (libcurl multi), whose four build settings are explained in `docs/DESIGN.md` §7.4. Three different promises live in three types there: relay's `maxInFlight` is the concurrency bound, a `Pacer` (`pacer.nim`) is the rate limit (one submission per `delayMs`, measured from the previous admission), and a `Sweep` is the batch, which owns the pending URLs, the client's window while it runs, and the outcomes. `fetchAll` is the small-batch convenience that returns `seq[FetchOutcome]`; a caller that must not hold every body in memory (thousands of pictures) drives `initSweep`/`next` instead and gets one outcome per URL in completion order.
 - JSON is handled **exclusively by `brian`** — never `std/json`, never a DOM. `brian`
   decodes straight into Nim types and encodes straight into a string.
 - `ref object` is used only where identity matters (the in-memory game index, UI state).
@@ -192,6 +192,44 @@ siblings: neither imports the other.
     filter menu (GNOME's secondary-menu icon), `action-unavailable-symbolic` for the
     filtered-to-nothing page, `starred-symbolic` for a loved tile.
 
+### `relay` gotchas (the HTTP client's own surprises)
+
+1. **Dispatch happens on a 250 ms poll cycle, not on `startRequest`.** The worker adds a
+   queued request to the multi handle at the top of its loop, after the current
+   `multi.poll(MultiWaitMaxMs)` returns, so a request admitted while another is in flight
+   can reach the server up to ~250 ms later. Measured against a local server: with a
+   1600 ms floor and 2.5 s answers, admissions were exactly 1600 ms apart while arrivals
+   were 1752.8 ms and 1499.0 ms apart, and both requests were on the server at once. Pace
+   *admissions*; never read a single arrival gap as the rate limit.
+2. **There is no wait-with-timeout.** `waitForResult` blocks and `pollForResult` does not,
+   so a scheduler that must also react to something else — here, the moment the pacer
+   admits the next submission — can only poll in slices. Blocking on the whole floor while
+   answers are outstanding is the trap: when answers are slower than the delay, the window
+   runs empty and the overlap the client was contributing disappears.
+3. **`waitForResult` returning `false` is the only early notice that the worker stopped,
+   and polling never sees it.** A stopped worker still delivers a result for everything
+   already in flight (`teInternal`) and then dispatches nothing, so a caller that keeps
+   enqueueing after a stall waits forever. `fetch.nim` therefore bounds silence itself
+   (`StallMs`, twice relay's own request timeout) rather than trusting a return value it
+   cannot observe.
+4. **Request ids must be unique per *client*, not per batch.** Results arrive in completion
+   order and are correlated only by `Response.request.requestId`; ids restarting at zero
+   for every batch would let an abandoned batch's result be attributed to a live one. The
+   sweep draws from one counter on the client.
+5. **`maxInFlight` is the number of easy handles allocated up front**, so it is a hard
+   ceiling on concurrency, and `newRelay` starts a worker thread per instance with libcurl
+   init/cleanup per instance. One instance per process is the intended shape: the CLI makes
+   one client per command and closes it in a `finally`.
+6. **`close` waits for queued and in-flight work and then discards undrained results**;
+   `abort` cancels immediately. Both belong to the thread that created the instance, and
+   `close` is also the only safe way out of a batch abandoned half-drained.
+7. **`makeRequest`/`makeRequests` refuse a busy client** (`IOError`), and "busy" counts
+   undrained results too. A caller that mixes them with `startRequest` has to keep the
+   window empty; the sweep uses `startRequest` plus `pollForResult` only.
+8. **`startRequests` empties the batch it is given** (the specs move into the queue), so
+   `batch.len` has to be captured before the call — which is what `examples/streaming.nim`
+   and the contract tests do.
+
 ## Showing pictures at their own size
 
 The viewer shows an image with `ContentScaleDown`, never `ContentContain`, so a 600px
@@ -297,9 +335,10 @@ HTTP/1.1 200
 
 The status is cached because a `404` is an answer worth remembering (ProtonDB returns
 `404` for "nobody reported this game"), not a failure. A corrupt cache file is a miss,
-not an exception. `--offline` never opens a socket and fails on a cache miss; the tests
-use this. Any non-`2xx`/`404` status is returned to the caller; only `429` and `5xx` are
-retried with backoff. `FetchError` is the client's error type; `Defect` is re-raised so
+not an exception. Answers are cached, problems are not: a `429` or `5xx` that survived
+retrying is a problem and is deliberately left out of the cache, so the next run asks
+again. `--offline` never opens a socket and fails on a cache miss; the tests
+use this. `FetchError` is the client's error type; `Defect` is re-raised so
 a programming bug is never recorded as a source outage.
 
 Per-source default request delays are in `enrich.defaultDelayMs` (ProtonDB 250 ms,
