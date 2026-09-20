@@ -11,6 +11,12 @@
       "url": "https://github.com/can-lehmann/owlkettle",
       "commit": "edc5256390eb97d77b829439aece0cbf5d629255",
       "version": ""
+    },
+    "relay": {
+      "dir": "$deps/relay",
+      "url": "https://github.com/planetis-m/relay",
+      "commit": "6b398f9482b2c931e3ed1ccc78c05073cc813476",
+      "version": ""
     }
   },
   "nimcfg": [
@@ -18,11 +24,17 @@
     "--hints:off",
     "# The enrichment sources are HTTPS only, so TLS is not optional for the CLI.",
     "--define:ssl",
+    "# The window is built on libadwaita toolbars, so it only builds with the target",
+    "# Adwaita minor version declared. 1.4 is the oldest release with AdwToolbarView,",
+    "# and it already requires GTK 4.10, which is why the GTK minor target matches.",
+    "--define:adwminor=4",
+    "--define:gtkminor=10",
     "",
     "############# begin Atlas config section ##########",
     "--noNimblePath",
     "--path:\"deps/brian/src\"",
     "--path:\"deps/owlkettle\"",
+    "--path:\"deps/relay/src\"",
     "############# end Atlas config section   ##########",
     ""
   ],
@@ -39,6 +51,7 @@
       "requires \"nim >= 2.0.0\"",
       "requires \"https://github.com/planetis-m/brian\"",
       "requires \"https://github.com/can-lehmann/owlkettle\"",
+      "requires \"https://github.com/planetis-m/relay\"",
       "",
       ""
     ]

@@ -1,5 +1,5 @@
 version = "0.1.0"
-author = "ageralis"
+author = "planetis-m"
 description = "Local-first catalog and recommender for Linux-playable games"
 license = "MIT"
 srcDir = "src"
@@ -8,4 +8,5 @@ bin = @["ludex"]
 requires "nim >= 2.0.0"
 requires "https://github.com/planetis-m/brian"
 requires "https://github.com/can-lehmann/owlkettle"
+requires "https://github.com/planetis-m/relay"
 
