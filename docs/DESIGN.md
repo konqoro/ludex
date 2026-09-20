@@ -416,6 +416,11 @@ One caching, rate-limited client on top of `relay` (a libcurl-multi wrapper), wi
   inside the window budget the floor is there to respect. `Pacer.hold` keeps the useful half
   of a bucket: a 429 pushes every admission back, which is the part that responds to a
   source actually complaining.
+- **Rejected: an iterator over the batch.** `for outcome in client.sweep(urls)` reads
+  better than a cursor, but `break` out of a `for` over an inline iterator skips the
+  iterator's remaining code, and a sweep that stops early leaves results undrained in a
+  *shared* relay instance. The batch state has to be an object the caller drives
+  explicitly, or the lifecycle is a trap.
 - **Cost of the dependency.** `relay` shares `ref` objects across its worker thread, so it
   requires `--threads:on` and `--mm:atomicArc`, and it binds libcurl without linking it.
   Nim has no per-module memory model and `nimble`/Atlas do not propagate a dependency's
