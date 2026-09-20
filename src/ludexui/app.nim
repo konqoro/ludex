@@ -801,6 +801,15 @@ proc showAbout(app: AppState) =
 when defined(ludexSnapshot):
   proc applyScene(app: AppState)
 
+proc page(content: Widget): Widget =
+  ## An opaque full-page layer shown over the library. The library stays mounted
+  ## underneath, so its widget and scroll position survive a detail visit; the
+  ## background stops the grid showing through the page.
+  result = gui:
+    Box(orient = OrientY):
+      style = [StyleClass("background")]
+      insert(content)
+
 method view(app: AppState): Widget =
   when defined(ludexSnapshot):
     app.applyScene()
@@ -813,12 +822,12 @@ method view(app: AppState): Widget =
           insert(header(app)) {.addTop.}
           if app.searching and app.selected.isNone:
             insert(searchField(app)) {.addTop.}
-          if app.viewer.isSome and app.selected.isSome:
-            insert(viewer(app))
-          elif app.selected.isSome:
-            insert(game(app))
-          else:
+          Overlay:
             insert(collection(app))
+            if app.selected.isSome:
+              insert(page(game(app))) {.addOverlay.}
+            if app.viewer.isSome and app.selected.isSome:
+              insert(page(viewer(app))) {.addOverlay.}
 
 when defined(ludexSnapshot):
   var
