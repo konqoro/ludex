@@ -9,7 +9,7 @@ import std/[options, os, strutils, tables]
 
 import ludexcore/[models, sources/awac, sources/protondb, store]
 import ludexcore/sources/[steamdeck, steamreviews, steamspy, steamstore]
-import ludexingest/[fetch, enrich]
+import ludexingest/[cache, enrich, fetch]
 
 const
   ProtonDir = currentSourcePath().parentDir() / "fixtures" / "protondb"
